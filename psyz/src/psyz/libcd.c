@@ -1,6 +1,7 @@
 #include <psyz.h>
 #include <libetc.h>
 #include <libcd.h>
+#include <libpress.h>
 #include <psyz/log.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <limits.h>
 #include <kernel.h>
 #include "../internal.h"
+#include "../../decomp/src/libcd/libcd_stream.h"
 #include "../../decomp/src/libspu/libspu_private.h"
 
 #define SECTOR_SIZE 2352
@@ -388,7 +390,10 @@ int Psyz_CdSetDiskPath(const char* diskPath) {
 }
 
 static PsyzCdReadCB disk_read_cb = NULL;
+static int stream_active = 0;
 void Psyz_CdSetReadCB(PsyzCdReadCB cb) { disk_read_cb = cb; }
+int Psyz_CdFileBridgeActive(void) { return disk_read_cb != NULL; }
+void Psyz_CdSetStreamActive(int active) { stream_active = active ? 1 : 0; }
 
 #define N_CHANNELS 2
 #define SAMPLE_SIZE sizeof(short)
@@ -749,6 +754,13 @@ static int open_track_at_cd_pos(void) {
     int sector = CdPosToInt(&CD_pos);
     TrackEntry* track = find_track_for_sector(sector);
     if (!track) {
+        /* File bridge (packed runtime STR / Psyz_CdSetReadCB) serves LBAs
+         * without a cue/bin track. */
+        if (disk_read_cb) {
+            close_track_file();
+            DEBUGF("file bridge open at sector %d (no cue track)", sector);
+            return 0;
+        }
         WARNF("no track found for sector %d", sector);
         return -1;
     }
@@ -860,6 +872,7 @@ static void psyz_stop() {
     xa.active = 0;
     data_read_active = 0;
     data_sector_valid = 0;
+    stream_active = 0;
     close_track_file();
     cd_buf_pos = 0;
     cd_buf_count = 0;
@@ -872,6 +885,7 @@ static void psyz_pause() {
     xa.active = 0;
     data_read_active = 0;
     data_sector_valid = 0;
+    stream_active = 0;
     Psyz_AudioUnlock();
 }
 
@@ -1037,7 +1051,31 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         break;
     case CdlReadN:
     case CdlReadS:
-        if (CD_mode & CdlModeRT) {
+        /* stream_active is latched by CdRead2: CdlModeStream (0x100) does not
+         * fit in the u8 Setmode parameter, so CD_mode alone is insufficient. */
+        if (stream_active || (CD_mode & CdlModeStream)) {
+            /* STR video path: feed DataReady → StCdInterrupt. RT/XA is
+             * best-effort alongside (Task 4); missing cue must not block. */
+            stream_active = 1;
+            Psyz_AudioLock();
+            need_cdda_rewind = 1;
+            data_sector_number = CdPosToInt(&CD_pos);
+            data_sector_valid = 0;
+            data_getsector_count = 0;
+            data_read_active = 1;
+            CD_status |= CdlStatRead;
+            Psyz_AudioUnlock();
+            if ((CD_mode & CdlModeRT) && open_track_at_cd_pos() == 0 &&
+                track_file) {
+                /* Cue/bin XA only for now; file-bridge XA is Task 4. */
+                Psyz_AudioLock();
+                xa_reset_stream();
+                xa.cur_abs_sector = CdPosToInt(&CD_pos) - 1;
+                xa.active = 1;
+                is_playing = 1;
+                Psyz_AudioUnlock();
+            }
+        } else if (CD_mode & CdlModeRT) {
             psyz_xa_read();
         } else {
             Psyz_AudioLock();
@@ -1093,16 +1131,22 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             LOG_ONCE("%s does not support CdlModeSize0", CD_comstr[com]);
         }
         if (*param & CdlModeSize1) {
-            LOG_ONCE("%s does not support CdlModeSize1", CD_comstr[com]);
+            if (!disk_read_cb) {
+                LOG_ONCE("%s does not support CdlModeSize1", CD_comstr[com]);
+            }
         }
         if (*param & CdlModeSpeed) {
             LOG_ONCE("%s does not support CdlModeSpeed", CD_comstr[com]);
         }
         if (*param & CdlModeStream2) {
-            LOG_ONCE("%s does not support CdlModeStream2", CD_comstr[com]);
+            if (!disk_read_cb) {
+                LOG_ONCE("%s does not support CdlModeStream2", CD_comstr[com]);
+            }
         }
         if (*param & CdlModeStream) {
-            LOG_ONCE("%s does not support CdlModeStream", CD_comstr[com]);
+            if (!disk_read_cb) {
+                LOG_ONCE("%s does not support CdlModeStream", CD_comstr[com]);
+            }
         }
         Psyz_AudioLock();
         CD_mode = *param;
@@ -1272,4 +1316,161 @@ int CdReadSync(int mode, u_char* result) {
     return 0;
 }
 
-void StCdInterrupt(void) { NOT_IMPLEMENTED; }
+static void stream_consume_sector(void) {
+    data_sector_valid = 0;
+    data_getsector_count = 0;
+    data_sector_number++;
+}
+
+void StCdInterrupt(void) {
+    u_char result[8];
+    StHEADER* ring;
+    StHEADER hdr;
+    u_long* dst;
+    const u_char* user;
+    int ready;
+    u16 magic;
+    u16 chan;
+
+    if (!StRingAddr || StRingSize <= 0) {
+        return;
+    }
+    if (StFinalSector == 1) {
+        return;
+    }
+    /* Defer when MDEC out DMA is busy (Sony StCdIntrFlag handshake). */
+    if (StRgb24 != 0 && DecDCToutSync(1) != 0) {
+        StCdIntrFlag = 1;
+        return;
+    }
+
+    ready = CdReady(1, result);
+    if (ready == CdlDiskError) {
+        return;
+    }
+    if (ready != CdlDataReady || !data_sector_valid) {
+        return;
+    }
+    if (result[0] & CdlStatShellOpen) {
+        return;
+    }
+
+    /* Size1 / Mode2 user payload starts after sync(12)+header(4)+sub(8). */
+    user = data_sector + 24;
+    memcpy(&hdr, user, sizeof(hdr));
+    magic = hdr.id;
+    chan = (u16)((hdr.type >> 10) & 0x1F);
+
+    /* Skip XA / non-video sectors interleaved in the STR extent. */
+    if (magic != 0x0160 || chan != (u16)StCHANNEL) {
+        stream_consume_sector();
+        return;
+    }
+
+    ring = &StRingAddr[StRingIdx1];
+    if (ring->id != 0) {
+        stream_consume_sector();
+        return;
+    }
+
+    if (StSTART_FLAG != 0 && StStartFrame != 0 &&
+        (u32)hdr.frameCount != (u32)StStartFrame) {
+        stream_consume_sector();
+        return;
+    }
+    if (StSTART_FLAG != 0 && StStartFrame != 0 &&
+        (u32)hdr.frameCount == (u32)StStartFrame) {
+        StSTART_FLAG = 0;
+    }
+
+    if (hdr.secCount != (u_short)Stsector_offset) {
+        init_ring_status(StRingIdx2, (u32)(StRingIdx1 - StRingIdx2));
+        StRingIdx1 = StRingIdx2;
+        Stsector_offset = 0;
+        Stframe_no = 0;
+        stream_consume_sector();
+        return;
+    }
+
+    if (hdr.secCount == 0) {
+        Stsector_offset = 0;
+        Stframe_no = (s32)hdr.frameCount;
+        if (StEndFrame != 0 && (u32)hdr.frameCount >= (u32)StEndFrame) {
+            Stsector_offset = 0;
+            Stframe_no = 0;
+            init_ring_status(StRingIdx2, (u32)(StRingIdx1 - StRingIdx2));
+            StRingIdx1 = StRingIdx2;
+            stream_consume_sector();
+            return;
+        }
+        if ((u32)(StRingSize - StRingIdx1 - 1) < (u32)hdr.nSectors) {
+            if (StRingAddr[0].id != 0) {
+                stream_consume_sector();
+                return;
+            }
+            /* Wrap to ring start and copy header there. */
+            StRingIdx1 = 0;
+            ring = &StRingAddr[0];
+        }
+        StRingIdx2 = StRingIdx1;
+    }
+
+    memcpy(ring, &hdr, sizeof(StHEADER));
+    CdIntToPos(data_sector_number, &ring->loc);
+
+    dst = (u_long*)(&StRingAddr[StRingSize] + (StRingIdx1 * 0x3F));
+    memcpy(dst, user + 32, 2016);
+
+    ring->id = 3;
+    Stsector_offset++;
+    StRingIdx1++;
+
+    if ((hdr.nSectors - 1) == hdr.secCount) {
+        StFinalSector = 1;
+        Stsector_offset = 0;
+        Stframe_no = 0;
+        data_ready_callback();
+        {
+            static int frames_ready;
+            if (frames_ready < 1) {
+                fprintf(stderr,
+                        "dw3-str: first frame ready fc=%u %ux%u sectors=%u\n",
+                        (unsigned)hdr.frameCount, (unsigned)hdr.width,
+                        (unsigned)hdr.height, (unsigned)hdr.nSectors);
+                frames_ready++;
+            }
+        }
+    }
+
+    stream_consume_sector();
+}
+
+void Psyz_CdPumpStream(void) {
+    int i;
+
+    if (!stream_active && !(CD_mode & (CdlModeStream | CdlModeStream2))) {
+        return;
+    }
+    if (StCdIntrFlag) {
+        StCdInterrupt();
+        StCdIntrFlag = 0;
+        return;
+    }
+    if (!data_read_active) {
+        return;
+    }
+    for (i = 0; i < 8; i++) {
+        StHEADER* probe;
+        if (StFinalSector == 1) {
+            break;
+        }
+        StCdInterrupt();
+        if (!StRingAddr) {
+            break;
+        }
+        probe = &StRingAddr[StRingIdx3];
+        if (probe->id == 2 || probe->id == 1) {
+            break;
+        }
+    }
+}
