@@ -187,6 +187,7 @@ set(PSYZ_SOURCES
     ../decomp/src/libsnd/vs_vtc.c
     ../decomp/src/libc2/rand.c
     src/psyz/libsnd.c
+    src/psyz/midiread_host.c
     src/psyz/libsn.c
     src/psyz/libpress.c
     ../decomp/src/libpress/libpress.c
