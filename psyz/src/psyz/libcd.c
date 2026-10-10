@@ -1468,7 +1468,12 @@ void StCdInterrupt(void) {
                 }
                 return;
             }
-            /* Wrap to ring start and copy header there. */
+            /* Sony ring: id=1 at the current write index is the end-of-ring
+             * sentinel. StGetNext sees it, resets StRingIdx3 to 0, then takes
+             * the frame at ring[0]. Without this, Idx3 sticks past the last
+             * freed frame (~3×9-sector MOVIEOPN) and decodeNextFrame starves
+             * while DecDCTin keeps replaying the same VLC buffer. */
+            StRingAddr[StRingIdx1].id = 1;
             StRingIdx1 = 0;
             ring = &StRingAddr[0];
         }
