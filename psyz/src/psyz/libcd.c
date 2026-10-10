@@ -575,15 +575,32 @@ static int xa_decode_user_mono_4bit(const unsigned char* user) {
     return frame;
 }
 
+/* Read one absolute 2352-byte sector for XA. File bridge (Psyz_CdSetReadCB)
+ * is preferred so packed runtime STR works without a cue/bin track_file. */
+static int xa_read_raw_sector(int abs_sector, unsigned char* sector) {
+    if (disk_read_cb) {
+        struct PsyzCdRead read = {
+            (unsigned int)abs_sector, SECTOR_SIZE, sector};
+        return disk_read_cb(&read) < 0 ? -1 : 0;
+    }
+    if (!track_file) {
+        return -1;
+    }
+    if (fread(sector, 1, SECTOR_SIZE, track_file) != SECTOR_SIZE) {
+        return -1;
+    }
+    return 0;
+}
+
 static int xa_read_and_decode_sector(void) {
     unsigned char sector[SECTOR_SIZE];
     int gap = 0;
     while (!xa.stream_ended) {
-        const size_t n = fread(sector, 1, SECTOR_SIZE, track_file);
-        if (n != SECTOR_SIZE) {
+        const int next = xa.cur_abs_sector + 1;
+        if (xa_read_raw_sector(next, sector) != 0) {
             return 0; // EOF or short read
         }
-        xa.cur_abs_sector++;
+        xa.cur_abs_sector = next;
         const unsigned char file = sector[0x10];
         const unsigned char channel = sector[0x11];
         const unsigned char submode = sector[0x12];
@@ -609,6 +626,18 @@ static int xa_read_and_decode_sector(void) {
             xa.decoded_count = xa_decode_user_mono_4bit(user);
         }
         xa.decoded_pos = 0;
+        {
+            static int xa_sectors_decoded;
+            if (xa_sectors_decoded < 1) {
+                fprintf(stderr,
+                        "psyz-xa: decoded sector %d file=%u chan=%u "
+                        "submode=0x%02x ci=0x%02x frames=%d (%s)\n",
+                        next, (unsigned)file, (unsigned)channel,
+                        (unsigned)submode, (unsigned)ci, xa.decoded_count,
+                        disk_read_cb ? "file-bridge" : "track-file");
+                xa_sectors_decoded++;
+            }
+        }
         return 1;
     }
     memset(xa.decoded, 0, sizeof(xa.decoded));
@@ -661,7 +690,8 @@ static size_t xa_pull_samples(short* buf, size_t max_frames) {
     size_t written = 0;
     int hit_eof = 0;
     Psyz_AudioLock();
-    if (!is_playing || !track_file || !xa.active) {
+    /* track_file is optional when Psyz_CdSetReadCB serves sectors. */
+    if (!is_playing || !xa.active || (!track_file && !disk_read_cb)) {
         goto end;
     }
     // Prime Hermite ring on first call so we have y0..y2 valid.
@@ -1066,14 +1096,24 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             CD_status |= CdlStatRead;
             Psyz_AudioUnlock();
             if ((CD_mode & CdlModeRT) && open_track_at_cd_pos() == 0 &&
-                track_file) {
-                /* Cue/bin XA only for now; file-bridge XA is Task 4. */
+                (track_file || disk_read_cb)) {
                 Psyz_AudioLock();
                 xa_reset_stream();
                 xa.cur_abs_sector = CdPosToInt(&CD_pos) - 1;
                 xa.active = 1;
                 is_playing = 1;
                 Psyz_AudioUnlock();
+                {
+                    static int xa_stream_logged;
+                    if (xa_stream_logged < 1) {
+                        fprintf(stderr,
+                                "psyz-xa: RT stream active at sector %d via %s\n",
+                                CdPosToInt(&CD_pos),
+                                track_file ? "track-file"
+                                           : "file-bridge");
+                        xa_stream_logged++;
+                    }
+                }
             }
         } else if (CD_mode & CdlModeRT) {
             psyz_xa_read();

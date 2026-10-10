@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define N_CHANNELS 2
 #define SAMPLE_SIZE sizeof(short)
@@ -41,8 +42,18 @@ int Psyz_AudioInit(void) {
     Psyz_SpuInit();
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-            ERRORF("failed to init SDL audio: %s", SDL_GetError());
-            return -1;
+            /* SDL builds without Pulse/ALSA report "No available audio
+             * device" at subsystem init. AUDIODRIVER is latched on first
+             * attempt — Quit + setenv dummy, then retry so XA/CDDA still
+             * pull through Psyz_SpuPullSamples (silent). */
+            WARNF("SDL audio init failed (%s); trying SDL_AUDIODRIVER=dummy",
+                  SDL_GetError());
+            setenv("SDL_AUDIODRIVER", "dummy", 1);
+            SDL_Quit();
+            if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+                ERRORF("failed to init SDL audio: %s", SDL_GetError());
+                return -1;
+            }
         }
     }
 
@@ -59,6 +70,20 @@ int Psyz_AudioInit(void) {
     };
     sdl_stream = SDL_OpenAudioDeviceStream(
         SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_callback, NULL);
+    if (!sdl_stream) {
+        WARNF("default audio device failed (%s); trying SDL_AUDIODRIVER=dummy",
+              SDL_GetError());
+        setenv("SDL_AUDIODRIVER", "dummy", 1);
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            ERRORF("failed to init SDL dummy audio: %s", SDL_GetError());
+            SDL_DestroyMutex(mutex);
+            mutex = NULL;
+            return -1;
+        }
+        sdl_stream = SDL_OpenAudioDeviceStream(
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_callback, NULL);
+    }
     if (!sdl_stream) {
         ERRORF("failed to open audio device: %s", SDL_GetError());
         SDL_DestroyMutex(mutex);
