@@ -1545,6 +1545,10 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     SDL_EndGPUCopyPass(copy);
     MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
     SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    /* Movie DecDCToutCallback chains LoadImage recursively; the upload
+     * transfer buffer cannot be remapped until this command buffer is
+     * submitted. */
+    SubmitCmd();
 }
 
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
