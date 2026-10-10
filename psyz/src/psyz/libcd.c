@@ -1408,8 +1408,18 @@ void StCdInterrupt(void) {
     }
 
     ring = &StRingAddr[StRingIdx1];
+    /* Ring slot still owned by a prior sector: backpressure — do NOT advance
+     * the CD position. Dropping here desyncs STR (secCount gaps) and stalls
+     * StGetNext after ~ring_size/nSectors frames (~3 for MOVIEOPN). */
     if (ring->id != 0) {
-        stream_consume_sector();
+        static int ring_full_logs;
+        if (ring_full_logs < 3) {
+            fprintf(stderr,
+                    "dw3-str: ring backpressure idx1=%d id=%u fc=%u sec=%u/%u\n",
+                    StRingIdx1, (unsigned)ring->id, (unsigned)hdr.frameCount,
+                    (unsigned)hdr.secCount, (unsigned)hdr.nSectors);
+            ring_full_logs++;
+        }
         return;
     }
 
@@ -1445,7 +1455,17 @@ void StCdInterrupt(void) {
         }
         if ((u32)(StRingSize - StRingIdx1 - 1) < (u32)hdr.nSectors) {
             if (StRingAddr[0].id != 0) {
-                stream_consume_sector();
+                /* Need wrap but start still occupied — wait for StFreeRing. */
+                static int wrap_full_logs;
+                if (wrap_full_logs < 3) {
+                    fprintf(stderr,
+                            "dw3-str: ring wrap wait idx1=%d need=%u "
+                            "ring0id=%u fc=%u\n",
+                            StRingIdx1, (unsigned)hdr.nSectors,
+                            (unsigned)StRingAddr[0].id,
+                            (unsigned)hdr.frameCount);
+                    wrap_full_logs++;
+                }
                 return;
             }
             /* Wrap to ring start and copy header there. */
@@ -1471,13 +1491,15 @@ void StCdInterrupt(void) {
         Stframe_no = 0;
         data_ready_callback();
         {
-            static int frames_ready;
-            if (frames_ready < 1) {
+            static unsigned frames_ready;
+            frames_ready++;
+            if (frames_ready <= 3u || frames_ready == 10u ||
+                (frames_ready % 30u) == 0u) {
                 fprintf(stderr,
-                        "dw3-str: first frame ready fc=%u %ux%u sectors=%u\n",
-                        (unsigned)hdr.frameCount, (unsigned)hdr.width,
-                        (unsigned)hdr.height, (unsigned)hdr.nSectors);
-                frames_ready++;
+                        "dw3-str: frame ready #%u fc=%u %ux%u sectors=%u\n",
+                        frames_ready, (unsigned)hdr.frameCount,
+                        (unsigned)hdr.width, (unsigned)hdr.height,
+                        (unsigned)hdr.nSectors);
             }
         }
     }
@@ -1501,11 +1523,20 @@ void Psyz_CdPumpStream(void) {
     }
     for (i = 0; i < 8; i++) {
         StHEADER* probe;
+        int sec_before;
+        int valid_before;
         if (StFinalSector == 1) {
             break;
         }
+        sec_before = data_sector_number;
+        valid_before = data_sector_valid;
         StCdInterrupt();
         if (!StRingAddr) {
+            break;
+        }
+        /* No CD advance and sector still latched → ring backpressure. */
+        if (data_sector_valid && data_sector_number == sec_before &&
+            valid_before) {
             break;
         }
         probe = &StRingAddr[StRingIdx3];
