@@ -31,7 +31,10 @@ int MDEC_out_sync(void) { return 0; }
 
 u_long MDEC_status(void) { return 0; }
 
-int DecDCTvlc(u_long* bs, u_long* buf) {
+/* Weak stub: dw3-pc overrides with port/movies/dct_vlc.c (bsdec). */
+__attribute__((weak)) int DecDCTvlc(u_long* bs, u_long* buf) {
+    (void)bs;
+    (void)buf;
     NOT_IMPLEMENTED;
-    return 0;
+    return -1;
 }
