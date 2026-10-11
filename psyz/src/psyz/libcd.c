@@ -9,6 +9,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <time.h>
 #include <kernel.h>
 #include "../internal.h"
 #include "../../decomp/src/libcd/libcd_stream.h"
@@ -346,6 +347,9 @@ static int data_read_active = 0;
 static int data_sector_valid = 0;
 static int data_sector_number = 0;
 static int data_getsector_count = 0;
+/* Rearmed on each CdlReadN/S. The pump paces from this so a new movie does
+ * not inherit leftover sector credit. */
+static int stream_pace_reset = 1;
 
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
 // param = 0x00. Equals the absolute sector where the last track's file ends.
@@ -1093,6 +1097,7 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             data_sector_valid = 0;
             data_getsector_count = 0;
             data_read_active = 1;
+            stream_pace_reset = 1;
             CD_status |= CdlStatRead;
             Psyz_AudioUnlock();
             if ((CD_mode & CdlModeRT) && open_track_at_cd_pos() == 0 &&
@@ -1127,6 +1132,7 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             data_sector_valid = 0;
             data_getsector_count = 0;
             data_read_active = 1;
+            stream_pace_reset = 1;
             CD_status |= CdlStatRead;
         }
         break;
@@ -1512,8 +1518,52 @@ void StCdInterrupt(void) {
     stream_consume_sector();
 }
 
+/* PS1 double-speed is 150 sectors/s. VSync and StGetNext both call the pump,
+ * so a fixed 8 sectors per call feeds a 15 fps STR at the display rate and
+ * the picture runs ahead of XA. */
+#define CD_2X_PER_SEC 150u
+#define CD_PACE_CATCHUP 8u
+
+static uint64_t stream_pace_origin_us;
+static uint64_t stream_pace_granted;
+
+static uint64_t stream_mono_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static int stream_pace_budget(void) {
+    uint64_t now, due, budget;
+    if (stream_pace_reset || stream_pace_origin_us == 0) {
+        stream_pace_origin_us = stream_mono_us();
+        stream_pace_granted = 0;
+        stream_pace_reset = 0;
+        return 0;
+    }
+    now = stream_mono_us();
+    if (now < stream_pace_origin_us) {
+        stream_pace_origin_us = now;
+        stream_pace_granted = 0;
+        return 0;
+    }
+    due = ((now - stream_pace_origin_us) * CD_2X_PER_SEC) / 1000000ULL;
+    if (due <= stream_pace_granted) {
+        return 0;
+    }
+    budget = due - stream_pace_granted;
+    if (budget > CD_PACE_CATCHUP) {
+        /* A stall must not dump the rest of the movie on the next call. */
+        stream_pace_granted = due - CD_PACE_CATCHUP;
+        budget = CD_PACE_CATCHUP;
+    }
+    return (int)budget;
+}
+
 void Psyz_CdPumpStream(void) {
     int i;
+    int budget;
+    int delivered = 0;
 
     if (!stream_active && !(CD_mode & (CdlModeStream | CdlModeStream2))) {
         return;
@@ -1521,12 +1571,14 @@ void Psyz_CdPumpStream(void) {
     if (StCdIntrFlag) {
         StCdInterrupt();
         StCdIntrFlag = 0;
+        stream_pace_granted++;
         return;
     }
     if (!data_read_active) {
         return;
     }
-    for (i = 0; i < 8; i++) {
+    budget = stream_pace_budget();
+    for (i = 0; i < budget; i++) {
         StHEADER* probe;
         int sec_before;
         int valid_before;
@@ -1539,14 +1591,17 @@ void Psyz_CdPumpStream(void) {
         if (!StRingAddr) {
             break;
         }
-        /* No CD advance and sector still latched → ring backpressure. */
+        /* No CD advance and sector still latched → ring backpressure.
+         * Leave it uncounted so the next call retries the same sector. */
         if (data_sector_valid && data_sector_number == sec_before &&
             valid_before) {
             break;
         }
+        delivered++;
         probe = &StRingAddr[StRingIdx3];
         if (probe->id == 2 || probe->id == 1) {
             break;
         }
     }
+    stream_pace_granted += (uint64_t)delivered;
 }
