@@ -139,7 +139,10 @@ static void SetWindowSizeInPixels(int width, int height) {
 
 static float GetCurrentGameAspectRatio(int disp_w, int disp_h) {
     if (aspect_mode == PSYZ_ASPECT_DISPLAY) {
-        float vref = is_pal ? 288.0f : 240.0f;
+        // PAL too uses the 240-line reference: a PAL release of an NTSC
+        // game (DW3 EU) keeps the 240-line picture, which a 288-line
+        // reference stretched to 16:10.
+        float vref = 240.0f;
         return (4.0f / 3.0f) * ((float)set_disp_horiz / 256.0f) /
                ((float)set_disp_vert / vref);
     }
