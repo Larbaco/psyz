@@ -88,6 +88,14 @@ static Posi draw_area_start = {0, 0};
 static Posi draw_area_end = {0x10000, 0x10000};
 static SDL_Rect scissor_rect = {0, 0, VRAM_W, VRAM_H};
 
+// Side gutters (Psyz_VideoSetGutter). gutter_render has the VRAM's size and
+// scale; a gutter draw lands there shifted so the display's left edge is at
+// x = gutter_px. Its columns [0, gutter_px) and past gutter_px + display width
+// are the gutters; the middle is refreshed from VRAM before each present.
+static unsigned gutter_px = 0;
+static SDL_GPUTexture* gutter_render = NULL;
+static unsigned gutter_render_res = 0;
+
 static PsyzOverlayInitCB_SDL3GPU overlay_init_cb;
 PsyzOverlayInitCB_SDL3GPU Psyz_OverlayInit_SDL3GPU(
     PsyzOverlayInitCB_SDL3GPU cb) {
@@ -524,6 +532,51 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
 
 static void UpdateScissor(void);
 
+// whether the current drawing area is the display, which takes the gutters
+static bool GutterActive(void) {
+    return gutter_px > 0 && draw_area_start.x == display_area.x &&
+           draw_area_end.x == display_area.x + display_size.x - 1 &&
+           draw_area_end.y - draw_area_start.y + 1 == display_size.y;
+}
+
+static SDL_GPUTexture* GetGutterTarget(void) {
+    if (gutter_render && gutter_render_res == internal_res) {
+        return gutter_render;
+    }
+    if (gutter_render) {
+        SDL_ReleaseGPUTexture(device, gutter_render);
+        gutter_render = NULL;
+    }
+    const SDL_GPUTextureCreateInfo info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage =
+            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = VRAM_W * internal_res,
+        .height = VRAM_H * internal_res,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    gutter_render = SDL_CreateGPUTexture(device, &info);
+    if (!gutter_render) {
+        ERRORF("gutter texture creation failed: %s", SDL_GetError());
+        return NULL;
+    }
+    gutter_render_res = internal_res;
+    // start black: a fresh texture has undefined contents
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (cmd) {
+        const SDL_GPUColorTargetInfo target = {
+            .texture = gutter_render,
+            .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
+            .load_op = SDL_GPU_LOADOP_CLEAR,
+            .store_op = SDL_GPU_STOREOP_STORE,
+        };
+        SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &target, 1, NULL));
+    }
+    return gutter_render;
+}
+
 static SDL_GPUTexture* GetRenderTarget(void) {
     return internal_res <= 1 ? vram_render : scaled_vram_render;
 }
@@ -792,6 +845,29 @@ static void PlatformBackend_Present(void) {
                 };
                 float game_aspect =
                     GetCurrentGameAspectRatio(display_size.x, display_size.y);
+                SDL_GPUTexture* gutters = gutter_px > 0 && !rgb24_source &&
+                                                  !debug_show_vram
+                                              ? GetGutterTarget()
+                                              : NULL;
+                if (gutters) {
+                    // put the display between its gutters, then show all
+                    const SDL_GPUBlitInfo center = {
+                        .source = src,
+                        .destination = {.texture = gutters,
+                                        .x = gutter_px * n,
+                                        .y = src.y,
+                                        .w = src.w,
+                                        .h = src.h},
+                        .load_op = SDL_GPU_LOADOP_LOAD,
+                        .filter = SDL_GPU_FILTER_NEAREST,
+                    };
+                    SDL_BlitGPUTexture(cmd, &center);
+                    src.texture = gutters;
+                    src.x = 0;
+                    src.w = (Uint32)(display_size.x + 2 * (int)gutter_px) * n;
+                    game_aspect *= (float)(display_size.x + 2 * gutter_px) /
+                                   (float)display_size.x;
+                }
                 if (debug_show_vram) {
                     src.x = 0;
                     src.y = 0;
@@ -877,6 +953,11 @@ static void QuitPlatform(void) {
         if (scaled_vram_render) {
             SDL_ReleaseGPUTexture(device, scaled_vram_render);
             scaled_vram_render = NULL;
+        }
+        if (gutter_render) {
+            SDL_ReleaseGPUTexture(device, gutter_render);
+            gutter_render = NULL;
+            gutter_render_res = 0;
         }
         if (vram_sampler) {
             SDL_ReleaseGPUSampler(device, vram_sampler);
@@ -1045,6 +1126,25 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
     return 0;
 }
 
+unsigned Psyz_VideoGetGutter(void) { return gutter_px; }
+
+static void ClearTargetRect(SDL_GPUTexture* texture, int x, int y, int w,
+                            int h, u_char r, u_char g, u_char b);
+
+int Psyz_VideoSetGutter(unsigned px) {
+    if (px > PSYZ_GUTTER_MAX) {
+        return -1;
+    }
+    if (px != gutter_px) {
+        Draw_FlushBuffer(); // pending prims belong to the old gutter
+        if (gutter_render) {
+            ClearTargetRect(gutter_render, 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
+        }
+        gutter_px = px;
+    }
+    return 0;
+}
+
 static void ApplyDisplayPendingChanges() {
     if (!sdl3_window && !InitPlatform()) {
         return;
@@ -1087,12 +1187,20 @@ void Draw_DisplayEnable(unsigned int on) {
 }
 
 void Draw_DisplayArea(unsigned int x, unsigned int y) {
-    if (display_area.x != (int)x || display_area.y != (int)y)
+    bool moved = display_area.x != (int)x || display_area.y != (int)y;
+    if (moved)
         rgb24_dirty = true;
     display_area.x = (int)x;
     display_area.y = (int)y;
 
     Draw_FlushBuffer();
+    if (moved && gutter_px > 0 && gutter_render) {
+        // a flip: the buffer drawn next starts with black gutters
+        ClearTargetRect(gutter_render, 0, 0, VRAM_W, display_area.y, 0, 0, 0);
+        int below = display_area.y + display_size.y;
+        ClearTargetRect(
+            gutter_render, 0, below, VRAM_W, VRAM_H - below, 0, 0, 0);
+    }
     ApplyDisplayPendingChanges();
 }
 
@@ -1387,6 +1495,13 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             // TODO warn about unrecognized code
             break;
         }
+        // a background clear covering the drawing area covers the gutters too
+        if (!isTextured && GutterActive() &&
+            x + draw_offset.x == draw_area_start.x &&
+            w == draw_area_end.x - draw_area_start.x + 1) {
+            x -= (int)gutter_px;
+            w += 2 * (int)gutter_px;
+        }
         vertex_cur[0].x = (short)(x);
         vertex_cur[0].y = (short)(y);
         vertex_cur[1].x = (short)(x + w);
@@ -1444,11 +1559,10 @@ void Draw_SetOffset(int x, int y) {
     draw_offset.y = y;
 }
 
-void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
-    if (rect->w == 0 || rect->h == 0) {
-        return;
-    }
-    if (!sdl3_window && !InitPlatform()) {
+// fills a rectangle, in VRAM pixels, of a VRAM-sized (or scaled) target
+static void ClearTargetRect(SDL_GPUTexture* texture, int x, int y, int w,
+                            int h, u_char r, u_char g, u_char b) {
+    if (w <= 0 || h <= 0 || !texture) {
         return;
     }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
@@ -1457,14 +1571,14 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     }
 
     Vertex quad[4] = {0};
-    quad[0].x = rect->x;
-    quad[0].y = rect->y;
-    quad[1].x = (short)(rect->x + rect->w);
-    quad[1].y = rect->y;
-    quad[2].x = rect->x;
-    quad[2].y = (short)(rect->y + rect->h);
-    quad[3].x = (short)(rect->x + rect->w);
-    quad[3].y = (short)(rect->y + rect->h);
+    quad[0].x = (short)x;
+    quad[0].y = (short)y;
+    quad[1].x = (short)(x + w);
+    quad[1].y = (short)y;
+    quad[2].x = (short)x;
+    quad[2].y = (short)(y + h);
+    quad[3].x = (short)(x + w);
+    quad[3].y = (short)(y + h);
     for (int i = 0; i < 4; i++) {
         quad[i].r = r;
         quad[i].g = g;
@@ -1488,7 +1602,7 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     SDL_EndGPUCopyPass(copy);
 
     const SDL_GPUColorTargetInfo target = {
-        .texture = vram_render,
+        .texture = texture,
         .load_op = SDL_GPU_LOADOP_LOAD,
         .store_op = SDL_GPU_STOREOP_STORE,
     };
@@ -1498,6 +1612,23 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
     SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
     SDL_EndGPURenderPass(pass);
+}
+
+void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+    if (rect->w == 0 || rect->h == 0) {
+        return;
+    }
+    if (!sdl3_window && !InitPlatform()) {
+        return;
+    }
+    ClearTargetRect(vram_render, rect->x, rect->y, rect->w, rect->h, r, g, b);
+    // a clear of the whole display also clears its gutters
+    if (gutter_px > 0 && rect->x == display_area.x &&
+        rect->w == display_size.x) {
+        SDL_GPUTexture* gutters = GetGutterTarget();
+        ClearTargetRect(gutters, 0, rect->y,
+                        display_size.x + 2 * (int)gutter_px, rect->h, r, g, b);
+    }
     MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
     SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
 }
@@ -1650,6 +1781,9 @@ void Draw_ResetBuffer(void) {
     batch_has_texture = false;
 }
 
+static void DrawBatch(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* texture,
+                      SDL_Rect scissor, int offset_x);
+
 void Draw_FlushBuffer(void) {
     if (n_vertices == 0) {
         return;
@@ -1694,8 +1828,30 @@ void Draw_FlushBuffer(void) {
     }
     SDL_EndGPUCopyPass(copy);
 
+    DrawBatch(cmd, GetRenderTarget(), scissor_rect, draw_offset.x);
+    if (GutterActive()) {
+        // again into the gutter target, shifted so the display starts at
+        // gutter_px and clipped to the display plus both gutters
+        SDL_GPUTexture* gutters = GetGutterTarget();
+        if (gutters) {
+            const SDL_Rect wide = {
+                0, scissor_rect.y, display_size.x + 2 * (int)gutter_px,
+                scissor_rect.h};
+            DrawBatch(cmd, gutters, wide,
+                      draw_offset.x + (int)gutter_px - draw_area_start.x);
+        }
+    }
+    if (internal_res <= 1) {
+        MarkVramDirty(scissor_rect);
+    }
+    SyncScaledVramToNative();
+    Draw_ResetBuffer();
+}
+
+static void DrawBatch(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* texture,
+                      SDL_Rect scissor, int offset_x) {
     const SDL_GPUColorTargetInfo target = {
-        .texture = GetRenderTarget(),
+        .texture = texture,
         .load_op = SDL_GPU_LOADOP_LOAD,
         .store_op = SDL_GPU_STOREOP_STORE,
     };
@@ -1704,7 +1860,7 @@ void Draw_FlushBuffer(void) {
         const float grid_scale_x = GetDrawGridXScale();
         const float render_scale = (float)internal_res;
         const SDL_GPUViewport grid_viewport = {
-            .x = (float)draw_offset.x * render_scale * (1.0f - grid_scale_x),
+            .x = (float)offset_x * render_scale * (1.0f - grid_scale_x),
             .y = 0.0f,
             .w = (float)VRAM_W * render_scale * grid_scale_x,
             .h = (float)VRAM_H * render_scale,
@@ -1714,8 +1870,8 @@ void Draw_FlushBuffer(void) {
         SDL_SetGPUViewport(pass, &grid_viewport);
     }
     SDL_Rect scaled_scissor = {
-        scissor_rect.x * (int)internal_res, scissor_rect.y * (int)internal_res,
-        scissor_rect.w * (int)internal_res, scissor_rect.h * (int)internal_res};
+        scissor.x * (int)internal_res, scissor.y * (int)internal_res,
+        scissor.w * (int)internal_res, scissor.h * (int)internal_res};
     SDL_SetGPUScissor(pass, &scaled_scissor);
     const SDL_GPUBufferBinding vb = {.buffer = vbuf};
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
@@ -1724,8 +1880,7 @@ void Draw_FlushBuffer(void) {
     const SDL_GPUTextureSamplerBinding sampler_binding = {
         .texture = vram_sample, .sampler = vram_sampler};
     SDL_BindGPUFragmentSamplers(pass, 0, &sampler_binding, 1);
-    const float offset_ubo[4] = {
-        (float)draw_offset.x, (float)draw_offset.y, 0, 0};
+    const float offset_ubo[4] = {(float)offset_x, (float)draw_offset.y, 0, 0};
     SDL_PushGPUVertexUniformData(cmd, 0, offset_ubo, sizeof(offset_ubo));
 
     // every primitive (including lines, expanded to quads) is a triangle list
@@ -1763,9 +1918,4 @@ void Draw_FlushBuffer(void) {
         }
     }
     SDL_EndGPURenderPass(pass);
-    if (internal_res <= 1) {
-        MarkVramDirty(scissor_rect);
-    }
-    SyncScaledVramToNative();
-    Draw_ResetBuffer();
 }

@@ -198,6 +198,34 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier);
  */
 unsigned Psyz_VideoGetInternalResolution(void);
 
+/** Maximum accepted side gutter, in framebuffer pixels per side */
+#define PSYZ_GUTTER_MAX 64
+
+/**
+ * @brief Draw past the left and right edges of the display (widescreen)
+ *
+ * With a non-zero gutter, a drawing area exactly as wide and tall as the
+ * displayed framebuffer is extended by `px` columns on each side. The extra
+ * columns do not live in VRAM, which the game keeps using as usual: they are
+ * kept in side planes, and the presented picture becomes the framebuffer plus
+ * both gutters, with the aspect ratio widened to match. An untextured
+ * rectangle covering the whole drawing area (a background clear) is extended
+ * into the gutters too. Gutters start black on every buffer flip.
+ *
+ * Targets without this capability return -1 for any non-zero value.
+ *
+ * @param px gutter width per side, 0 (default, off) to PSYZ_GUTTER_MAX
+ * @return 0 on success, -1 if px is out of range or unsupported
+ */
+int Psyz_VideoSetGutter(unsigned px);
+
+/**
+ * @brief Get the current side gutter width
+ *
+ * @return gutter width per side in pixels, 0 when off
+ */
+unsigned Psyz_VideoGetGutter(void);
+
 /**
  * @brief Synchronize with vertical blank
  *

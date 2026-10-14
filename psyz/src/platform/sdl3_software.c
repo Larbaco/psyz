@@ -40,6 +40,70 @@ static bool preserve_masked;
 static unsigned grid_source = 1;
 static unsigned grid_target = 1;
 
+// Side gutters (Psyz_VideoSetGutter): columns past the left and right edges
+// of a display-sized drawing area, kept outside VRAM. Row y of a plane is the
+// gutter of VRAM row y; column 0 is the leftmost gutter pixel.
+static u16 gutter_planes[2][VRAM_H * PSYZ_GUTTER_MAX];
+static int gutter_px;
+static int gutter_x0;
+static int gutter_w;
+static int gutter_h;
+static bool gutter_active; // the current drawing area takes the gutters
+
+static void UpdateGutterActive(void) {
+    gutter_active =
+        gutter_px > 0 && draw_area_start.x == gutter_x0 &&
+        draw_area_end.x == gutter_x0 + gutter_w - 1 &&
+        (gutter_h <= 0 || draw_area_end.y - draw_area_start.y + 1 == gutter_h);
+}
+
+// leftmost and rightmost column a primitive may touch
+static int ClipX0(void) {
+    return gutter_active ? draw_area_start.x - gutter_px
+                         : (draw_area_start.x > 0 ? draw_area_start.x : 0);
+}
+
+static int ClipX1(void) {
+    return gutter_active
+               ? draw_area_end.x + gutter_px
+               : (draw_area_end.x < VRAM_W - 1 ? draw_area_end.x : VRAM_W - 1);
+}
+
+// the pixel (x, y) is written to, or NULL when it is clipped
+static u16* PixelPtr(int x, int y) {
+    if (y < draw_area_start.y || y > draw_area_end.y || y < 0 || y >= VRAM_H) {
+        return NULL;
+    }
+    if (x >= draw_area_start.x && x <= draw_area_end.x) {
+        return x >= 0 && x < VRAM_W ? &vram[y * VRAM_W + x] : NULL;
+    }
+    if (!gutter_active) {
+        return NULL;
+    }
+    if (x < draw_area_start.x && x >= draw_area_start.x - gutter_px) {
+        return &gutter_planes[0][y * PSYZ_GUTTER_MAX +
+                                 (x - (draw_area_start.x - gutter_px))];
+    }
+    if (x > draw_area_end.x && x <= draw_area_end.x + gutter_px) {
+        return &gutter_planes[1][y * PSYZ_GUTTER_MAX +
+                                 (x - draw_area_end.x - 1)];
+    }
+    return NULL;
+}
+
+static void FillGutterRows(int y0, int y1, u16 color) {
+    y0 = CLAMP(y0, 0, VRAM_H);
+    y1 = CLAMP(y1, 0, VRAM_H);
+    for (int side = 0; side < 2; side++) {
+        for (int y = y0; y < y1; y++) {
+            u16* row = &gutter_planes[side][y * PSYZ_GUTTER_MAX];
+            for (int x = 0; x < PSYZ_GUTTER_MAX; x++) {
+                row[x] = color;
+            }
+        }
+    }
+}
+
 static int Sign11(int value) {
     value &= 0x7ff;
     return (value ^ 0x400) - 0x400;
@@ -63,11 +127,10 @@ static u16 PackColor(int r, int g, int b, bool mask) {
 }
 
 static void WritePixel(int x, int y, u16 src, bool semi, int abr) {
-    if (x < draw_area_start.x || x > draw_area_end.x || y < draw_area_start.y ||
-        y > draw_area_end.y || x < 0 || x >= VRAM_W || y < 0 || y >= VRAM_H) {
+    u16* out = PixelPtr(x, y);
+    if (!out) {
         return;
     }
-    u16* out = &vram[y * VRAM_W + x];
     if (preserve_masked && (*out & 0x8000)) {
         return;
     }
@@ -179,12 +242,10 @@ static void RasterTriangle(
         c = swap;
         area = -area;
     }
-    int min_x = CLAMP(Min3(a.x, b.x, c.x), draw_area_start.x, draw_area_end.x);
-    int max_x = CLAMP(Max3(a.x, b.x, c.x), draw_area_start.x, draw_area_end.x);
+    int min_x = CLAMP(Min3(a.x, b.x, c.x), ClipX0(), ClipX1());
+    int max_x = CLAMP(Max3(a.x, b.x, c.x), ClipX0(), ClipX1());
     int min_y = CLAMP(Min3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
     int max_y = CLAMP(Max3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
-    min_x = CLAMP(min_x, 0, VRAM_W - 1);
-    max_x = CLAMP(max_x, 0, VRAM_W - 1);
     min_y = CLAMP(min_y, 0, VRAM_H - 1);
     max_y = CLAMP(max_y, 0, VRAM_H - 1);
     int abr = (tpage >> 5) & 3;
@@ -291,10 +352,11 @@ static void RasterSprite(
             y >= VRAM_H) {
             continue;
         }
+        int x0 = ClipX0();
+        int x1 = ClipX1();
         for (int px = 0; px < w; px++) {
             int x = origin->x + px;
-            if (x < draw_area_start.x || x > draw_area_end.x || x < 0 ||
-                x >= VRAM_W) {
+            if (x < x0 || x > x1) {
                 continue;
             }
             u16 color;
@@ -324,6 +386,7 @@ static void Software_Reset(void) {
     draw_area_start = (Point){0, 0};
     draw_area_end = (Point){VRAM_W - 1, VRAM_H - 1};
     set_mask_bit = preserve_masked = false;
+    UpdateGutterActive();
 }
 
 static void Software_SetTexpageMode(ParamDrawTexpageMode* p) {
@@ -344,9 +407,13 @@ static void Software_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
 
 static void Software_SetAreaStart(int x, int y) {
     draw_area_start = (Point){x, y};
+    UpdateGutterActive();
 }
 
-static void Software_SetAreaEnd(int x, int y) { draw_area_end = (Point){x, y}; }
+static void Software_SetAreaEnd(int x, int y) {
+    draw_area_end = (Point){x, y};
+    UpdateGutterActive();
+}
 
 static void Software_SetOffset(int x, int y) {
     draw_offset = (Point){Sign11(x), Sign11(y)};
@@ -380,6 +447,10 @@ static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
                 *p = color;
             }
         }
+    }
+    // a clear of the whole gutter-sized display also clears its gutters
+    if (gutter_px > 0 && rect->x == gutter_x0 && rect->w == gutter_w) {
+        FillGutterRows(rect->y, rect->y + rect->h, color);
     }
 }
 
@@ -558,6 +629,12 @@ static int Software_PushPrim(u_long* words, int max_len) {
             w = h = 16;
             break;
         }
+        // a background clear covering the drawing area covers the gutters too
+        if (gutter_active && !textured && origin.x == draw_area_start.x &&
+            w == draw_area_end.x - draw_area_start.x + 1) {
+            origin.x -= gutter_px;
+            w += gutter_px * 2;
+        }
         int source_w = w;
         if (grid_source != grid_target) {
             w = w * (int)grid_target / (int)grid_source;
@@ -573,6 +650,9 @@ static int Software_PushPrim(u_long* words, int max_len) {
 void SoftwareRasterizer_Reset(void) {
     memset(vram, 0, sizeof(vram));
     Software_Reset();
+    memset(gutter_planes, 0, sizeof(gutter_planes));
+    gutter_px = gutter_x0 = gutter_w = gutter_h = 0;
+    gutter_active = false;
     grid_source = grid_target = 1;
     twin_and_x = twin_and_y = 0xff;
     twin_or_x = twin_or_y = 0;
@@ -580,6 +660,28 @@ void SoftwareRasterizer_Reset(void) {
 }
 
 const u16* SoftwareRasterizer_GetVram(void) { return vram; }
+
+void SoftwareRasterizer_SetGutter(int px, int x0, int w, int h) {
+    px = CLAMP(px, 0, PSYZ_GUTTER_MAX);
+    if (px != gutter_px) {
+        FillGutterRows(0, VRAM_H, 0);
+    }
+    gutter_px = px;
+    gutter_x0 = x0;
+    gutter_w = w;
+    gutter_h = h;
+    UpdateGutterActive();
+}
+
+int SoftwareRasterizer_GetGutter(void) { return gutter_px; }
+
+const u16* SoftwareRasterizer_GetGutterPlane(int side) {
+    return gutter_planes[side ? 1 : 0];
+}
+
+void SoftwareRasterizer_ClearGutterRows(int y0, int y1) {
+    FillGutterRows(y0, y1, 0);
+}
 
 static void Software_FlushBuffer(void) {}
 static void Software_ResetBuffer(void) {}
