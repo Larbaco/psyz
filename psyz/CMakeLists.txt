@@ -16,6 +16,7 @@ if(NOT PSP)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
+    set(DARWIN ${APPLE})
     add_subdirectory(
         ${CMAKE_CURRENT_SOURCE_DIR}/../external/SDL
         ${CMAKE_CURRENT_BINARY_DIR}/sdl
