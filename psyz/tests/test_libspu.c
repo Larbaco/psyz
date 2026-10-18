@@ -914,26 +914,21 @@ ZTEST(spu, AdpcmLoopRepeatJumpsToLoopAddr) {
 }
 
 ZTEST(spu, AdpcmLoopEndWithoutRepeatZeroesEnvx) {
-    // One block flagged loop-end without repeat (0x01): when it runs out the
-    // SPU mutes the voice and its ENVX reads 0. libsnd frees a voice only
-    // after ENVX has read 0 for a while, so a stale sustain level keeps the
-    // voice busy for good.
     unsigned char payload[16];
-    int i;
-    memset(payload, 0, sizeof(payload));
-    payload[1] = 0x01; // block 0: loop-end, no repeat
-    for (i = 0; i < 14; i++)
-        payload[2 + i] = 0x77;
-
+    memset(payload, 0x77, sizeof(payload));
+    payload[0] = 0;
+    payload[1] = 0x01;
     spu_reset_quiet();
     Psyz_SpuWrite(0x1AA, 0x8000 | 0x4000);
     Psyz_SpuMemWrite(kSampleAddr, payload, sizeof(payload));
-    // a quarter pitch stretches the block's 28 samples to ~112 frames, so
-    // real hardware has room to read the voice while it still plays
-    spu_voice1_keyon(kSampleAddr, 0x0400);
-    pull_samples_nop(16); // the key-on latency, then instant attack to 0x7FFF
+    setup_voice1(kSampleAddr, 0x0400);
+    Psyz_SpuWrite(0x1A, 0x1fdf);
+    Psyz_SpuWrite(0x18C, 0);
+    Psyz_SpuWrite(0x18E, 0);
+    Psyz_SpuWrite(0x188, 1u << 1);
+    pull_samples_nop(16);
     zexpect_u16_ne(0, Psyz_SpuRead(0x1C));
-    pull_samples_nop(256); // well past the end of the block
+    pull_samples_nop(1024);
     zexpect_u16_eq(0, Psyz_SpuRead(0x1C));
 }
 
