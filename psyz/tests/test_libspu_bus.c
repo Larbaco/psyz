@@ -8,6 +8,7 @@
 #include "../../decomp/src/libsnd/libsnd_private.h"
 
 #include "ztest.h"
+#include "spu_mix_scene.h"
 
 // Host mixer buses (psyz/spu.h). Kept apart from test_libspu.c because
 // libsnd_private.h and that file declare the same libspu internals.
@@ -186,4 +187,49 @@ ZTEST(spu_bus, BusFollowsLibsndTrack) {
     Psyz_SndSetSeqBus(-1, 0, 1);
     Psyz_SndSetSeqBus(0, 16, 1);
     Psyz_SndSetSeqBus(3, 5, 0); // leave bus 0 for later tests
+}
+
+// Hash of spu_mix_scene_hash() rendered by psyz 2caa505, the last commit
+// before the buses (build the scene header against that tree to reproduce).
+#define kSceneGolden 0x95190ab95516a0c4ull
+
+static void scene_routes(int first_voice, int bus, int seq, int sep) {
+    int v;
+    Psyz_SndSetSeqBus((short)seq, (short)sep, bus);
+    for (v = first_voice; v < first_voice + 8; v++)
+        _svm_voice[v].seq_sep_no = (short)((sep << 8) | seq);
+}
+
+// The default mix is the mix the SPU had before the buses existed: with unity
+// gains, even voices spread over every bus render the same samples, and the
+// scene is a busy one (24 voices, reverb, envelopes, key-on / key-off).
+ZTEST(spu_bus, BusDefaultMixMatchesTheMixerWithoutBuses) {
+    uint64_t h;
+    int v;
+
+    for (v = 0; v < 24; v++)
+        _svm_voice[v].seq_sep_no = 0x21;
+    h = spu_mix_scene_hash(NULL, NULL);
+    zexpect_s32_eq(1, scene_peak > 1000 && scene_peak < 32767);
+    zexpect_u32_eq((uint32_t)(kSceneGolden >> 32), (uint32_t)(h >> 32));
+    zexpect_u32_eq((uint32_t)kSceneGolden, (uint32_t)h);
+
+    scene_routes(8, 1, 1, 2);
+    scene_routes(16, 2, 1, 3);
+    Psyz_SpuSetBusGain(3, 0x1234); // an unused bus does not matter
+    h = spu_mix_scene_hash(NULL, NULL);
+    zexpect_u32_eq((uint32_t)(kSceneGolden >> 32), (uint32_t)(h >> 32));
+    zexpect_u32_eq((uint32_t)kSceneGolden, (uint32_t)h);
+
+    // ...and a real gain on one bus does change the render
+    Psyz_SpuSetBusGain(1, PSYZ_SPU_GAIN_UNITY - 1);
+    h = spu_mix_scene_hash(NULL, NULL);
+    zexpect_s32_eq(1, h != kSceneGolden);
+
+    Psyz_SpuSetBusGain(1, PSYZ_SPU_GAIN_UNITY);
+    Psyz_SpuSetBusGain(3, PSYZ_SPU_GAIN_UNITY);
+    Psyz_SndSetSeqBus(1, 2, 0);
+    Psyz_SndSetSeqBus(1, 3, 0);
+    for (v = 0; v < 24; v++)
+        _svm_voice[v].seq_sep_no = 0x21;
 }
