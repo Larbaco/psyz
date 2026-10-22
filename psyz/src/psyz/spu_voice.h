@@ -135,7 +135,11 @@ static inline int spu_voice_decode_one_sample(VoiceState* vs, const u8* ram) {
         // end of block, and handle loop/end flags
         if (!vs->needs_decode && (vs->block_flags & 0x01)) {
             if (!(vs->block_flags & 0x02)) {
+                // loop end + mute: the voice is released with ENVX at 0,
+                // which is how libsnd's allocator learns that it is free
                 vs->active = 0;
+                vs->env_vol = 0;
+                vs->env_state = ADSR_OFF;
                 vs->gwin[vs->gpos] = 0;
                 vs->gpos = (vs->gpos + 1) & 3;
                 return 0;
