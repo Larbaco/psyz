@@ -94,6 +94,7 @@ typedef struct {
     u8 delay_ticks;       // key-on -> envelope-start pipeline latency
     u16 adsr_lo;          // mirrors SPU_VOICE_REG::adsr[0]
     u16 adsr_hi;          // mirrors SPU_VOICE_REG::adsr[1]
+    u8 bus;               // host mixer bus, latched at key-on (spu.h)
 } VoiceState;
 
 static inline void spu_voice_key_on(

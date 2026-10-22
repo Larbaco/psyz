@@ -156,3 +156,39 @@ void _SsSetNrpnVabAttr19(
     short a0, short a1, short a2, VagAtr a3, short a4, unsigned char a5) {
     NOT_IMPLEMENTED;
 }
+
+// Mixer buses (psyz/spu.h): which bus a voice joins when libsnd keys it on.
+// A SEP/SEQ voice carries seq_sep_no = (sep << 8) | seq_access_num; a voice
+// from SsUtKeyOn carries 0x21 and stays on bus 0, like any track the host
+// never routed.
+#define BUS_SEQ_MAX 32
+#define BUS_SEP_MAX 16
+static unsigned char seq_bus[BUS_SEQ_MAX][BUS_SEP_MAX];
+
+void Psyz_SndSetSeqBus(short seq_access_num, short sep_num, int bus) {
+    if (seq_access_num < 0 || seq_access_num >= BUS_SEQ_MAX || sep_num < 0 ||
+        sep_num >= BUS_SEP_MAX || bus < 0 || bus >= PSYZ_SPU_NUM_BUSES) {
+        return;
+    }
+    seq_bus[seq_access_num][sep_num] = (unsigned char)bus;
+}
+
+int psyz_snd_voice_bus(int voice) {
+    int seq_sep_no;
+    int seq;
+    int sep;
+
+    if (voice < 0 || voice >= NUM_VOICES) {
+        return 0;
+    }
+    seq_sep_no = (unsigned short)_svm_voice[voice].seq_sep_no;
+    if (seq_sep_no == 0x21) {
+        return 0;
+    }
+    seq = seq_sep_no & 0xFF;
+    sep = (seq_sep_no >> 8) & 0xFF;
+    if (seq >= BUS_SEQ_MAX || sep >= BUS_SEP_MAX) {
+        return 0;
+    }
+    return seq_bus[seq][sep];
+}
