@@ -532,11 +532,12 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
 
 static void UpdateScissor(void);
 
-// whether the current drawing area is the display, which takes the gutters
+// whether the current drawing area spans the display's columns, which takes
+// the gutters; any band of rows does (a banner closing from top and bottom)
 static bool GutterActive(void) {
     return gutter_px > 0 && draw_area_start.x == display_area.x &&
            draw_area_end.x == display_area.x + display_size.x - 1 &&
-           draw_area_end.y - draw_area_start.y + 1 == display_size.y;
+           draw_area_end.y >= draw_area_start.y;
 }
 
 static SDL_GPUTexture* GetGutterTarget(void) {

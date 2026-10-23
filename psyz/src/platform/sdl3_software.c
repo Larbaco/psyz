@@ -47,14 +47,14 @@ static u16 gutter_planes[2][VRAM_H * PSYZ_GUTTER_MAX];
 static int gutter_px;
 static int gutter_x0;
 static int gutter_w;
-static int gutter_h;
 static bool gutter_active; // the current drawing area takes the gutters
 
+// An area spanning the display's columns takes the gutters, whatever its
+// height: a layer clipped to a band of rows (a banner closing from the top
+// and the bottom) still reaches the side gutters in those rows.
 static void UpdateGutterActive(void) {
-    gutter_active =
-        gutter_px > 0 && draw_area_start.x == gutter_x0 &&
-        draw_area_end.x == gutter_x0 + gutter_w - 1 &&
-        (gutter_h <= 0 || draw_area_end.y - draw_area_start.y + 1 == gutter_h);
+    gutter_active = gutter_px > 0 && draw_area_start.x == gutter_x0 &&
+                    draw_area_end.x == gutter_x0 + gutter_w - 1;
 }
 
 // leftmost and rightmost column a primitive may touch
@@ -651,7 +651,7 @@ void SoftwareRasterizer_Reset(void) {
     memset(vram, 0, sizeof(vram));
     Software_Reset();
     memset(gutter_planes, 0, sizeof(gutter_planes));
-    gutter_px = gutter_x0 = gutter_w = gutter_h = 0;
+    gutter_px = gutter_x0 = gutter_w = 0;
     gutter_active = false;
     grid_source = grid_target = 1;
     twin_and_x = twin_and_y = 0xff;
@@ -669,7 +669,7 @@ void SoftwareRasterizer_SetGutter(int px, int x0, int w, int h) {
     gutter_px = px;
     gutter_x0 = x0;
     gutter_w = w;
-    gutter_h = h;
+    (void)h; // the display height; any band of rows takes the gutters
     UpdateGutterActive();
 }
 

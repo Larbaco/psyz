@@ -204,8 +204,9 @@ unsigned Psyz_VideoGetInternalResolution(void);
 /**
  * @brief Draw past the left and right edges of the display (widescreen)
  *
- * With a non-zero gutter, a drawing area exactly as wide and tall as the
- * displayed framebuffer is extended by `px` columns on each side. The extra
+ * With a non-zero gutter, a drawing area exactly as wide as the displayed
+ * framebuffer (any band of its rows) is extended by `px` columns on each
+ * side. The extra
  * columns do not live in VRAM, which the game keeps using as usual: they are
  * kept in side planes, and the presented picture becomes the framebuffer plus
  * both gutters, with the aspect ratio widened to match. An untextured

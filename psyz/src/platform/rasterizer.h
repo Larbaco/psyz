@@ -30,8 +30,8 @@ void SoftwareRasterizer_Reset(void);
 const u16* SoftwareRasterizer_GetVram(void);
 
 // Side gutters, see Psyz_VideoSetGutter. They apply to drawing areas spanning
-// columns [x0, x0 + w) and h rows (any height when h <= 0); px = 0 turns them
-// off. A plane holds VRAM_H rows of PSYZ_GUTTER_MAX pixels, side 0 is left.
+// columns [x0, x0 + w), any band of rows (h, the display height, is kept for
+// callers and no longer narrows it); px = 0 turns them off. A plane holds VRAM_H rows of PSYZ_GUTTER_MAX pixels, side 0 is left.
 void SoftwareRasterizer_SetGutter(int px, int x0, int w, int h);
 int SoftwareRasterizer_GetGutter(void);
 const u16* SoftwareRasterizer_GetGutterPlane(int side);
