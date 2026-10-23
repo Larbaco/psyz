@@ -310,81 +310,121 @@ void _SsContResetAll(short seq_access_num, short seq_num) {
     score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
 }
 
-void _SsContNrpn1(
-    short seq_access_num, short seq_num, unsigned char val) {
+/*
+ * NRPN / RPN / Data Entry state machine. Field use follows retail libsnd
+ * (_SsContNrpn1 0x80030F48, _SsContNrpn2 0x80031048, _SsContRpn1/2
+ * 0x80031188/0x800311F8, _SsContDataEntry 0x800307F8 in the US executable),
+ * not the sotn-decomp names:
+ *   fn_idx (0x1A)  last CC#98 value (NRPN LSB, the VAB attribute index)
+ *   unk1B  (0x1B)  last CC#99 value (NRPN MSB: 20 loop start, 30 loop end)
+ *   unk1C  (0x1C)  1 after a loop start, until Data Entry latches the count
+ *   unk1D  (0x1D)  loop count from Data Entry (0 none, 1..126, 127 forever)
+ *   unk15  (0x15)  1 once the loop count has been latched
+ *   unk18/19       CC#100 / CC#101 values, unk1E counts them
+ *   unk1F  (0x1F)  counts CC#98 / CC#99 values since the last Data Entry
+ *   next_sep_pos   (0x08) loop start position (the position after the
+ *                  loop-start event's delta time)
+ */
+#define NRPN_USER_CB 40
+
+void _SsContNrpn1(short seq_access_num, short seq_num, unsigned char val) {
     struct SeqStruct* score = &_ss_score[seq_access_num][seq_num];
-    /* unk1D = pending loop count (NRPN data entry style) */
-    if (score->unk1C == 1 && score->unk10 == 0) {
-        score->unk1D = val;
-        score->unk10 = 1;
-    } else if (score->unk1E != NRPN_LOOP_END &&
-               score->unk1E != NRPN_LOOP_START) {
-        score->unk1F = val;
-        score->fn_idx++;
+    /* retail also calls the user NRPN callback when unk1B == 40; the host
+     * has no SsSetNrpnFunction. */
+    if (score->unk1B != NRPN_LOOP_END && score->unk1B != NRPN_LOOP_START &&
+        score->unk1B != NRPN_USER_CB) {
+        score->fn_idx = val;
+        score->unk1C = 0;
+        score->unk1F++;
     }
     score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
 }
 
-void _SsContNrpn2(
-    short seq_access_num, short seq_num, unsigned char val) {
+void _SsContNrpn2(short seq_access_num, short seq_num, unsigned char val) {
     struct SeqStruct* score = &_ss_score[seq_access_num][seq_num];
 
     switch (val) {
     case NRPN_LOOP_START:
-        score->unk1E = val;
+        score->unk1B = val;
         score->unk1C = 1;
         score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
-        score->loop_pos = score->seq_ptr;
+        score->next_sep_pos = score->seq_ptr;
         break;
     case NRPN_LOOP_END:
-        score->unk1E = val;
+        score->unk1B = val;
         if (score->unk1D == 0) {
-            score->unk10 = 0;
+            score->unk15 = 0;
             score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
         } else if (score->unk1D < 0x7F) {
             score->unk1D--;
             score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
             if (score->unk1D != 0) {
-                score->seq_ptr = score->loop_pos;
+                score->seq_ptr = score->next_sep_pos;
+                INFOF("SEP loop end -> loop start (count %d left) seq=%d tr=%d",
+                      score->unk1D, seq_access_num, seq_num);
             } else {
-                score->unk10 = 0;
+                score->unk15 = 0;
             }
         } else {
             (void)_SsReadDeltaValue(seq_access_num, seq_num);
             score->delta_value = 0;
-            score->seq_ptr = score->loop_pos;
+            score->seq_ptr = score->next_sep_pos;
+            INFOF("SEP loop end -> loop start (count infinite) seq=%d tr=%d",
+                  seq_access_num, seq_num);
         }
         break;
     default:
-        score->unk1E = val;
-        score->fn_idx++;
+        score->unk1B = val;
+        score->unk1F++;
         score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
         break;
     }
 }
 
-void _SsContRpn1(
-    short seq_access_num, short seq_num, unsigned char val) {
+void _SsContRpn1(short seq_access_num, short seq_num, unsigned char val) {
     struct SeqStruct* score = &_ss_score[seq_access_num][seq_num];
     score->unk18 = val;
-    score->unk1B++;
+    score->unk1E++;
     score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
 }
 
-void _SsContRpn2(
-    short seq_access_num, short seq_num, unsigned char val) {
+void _SsContRpn2(short seq_access_num, short seq_num, unsigned char val) {
     struct SeqStruct* score = &_ss_score[seq_access_num][seq_num];
     score->unk19 = val;
-    score->unk1B++;
+    score->unk1E++;
     score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
 }
 
+/*
+ * CC#6. Right after a loop start (CC#99 = 20) it carries the loop count; this
+ * is the only place unk1D is set, so a host that ignores it never loops (the
+ * track runs into its end-of-track meta and stops). Otherwise it completes a
+ * CC#100/101 pair (RPN: pitch bend range) or a CC#98/99 pair (NRPN: VAB
+ * attribute, SsFCALL.ccentry[fn_idx]); both only rewrite VAB data or the bend
+ * range of sounding voices, which the host does not model, so the pair is
+ * consumed and dropped.
+ */
 void _SsContDataEntry(
     short seq_access_num, short seq_num, unsigned char val) {
-    /* NRPN data-entry → VAB attr tables still ASM; skip safely. */
-    (void)val;
-    _ss_score[seq_access_num][seq_num].delta_value =
-        _SsReadDeltaValue(seq_access_num, seq_num);
+    struct SeqStruct* score = &_ss_score[seq_access_num][seq_num];
+
+    if (score->unk1C == 1 && score->unk15 == 0) {
+        score->unk1D = val;
+        score->unk1C = 0;
+        score->unk15 = 1;
+        INFOF("SEP loop count %d seq=%d tr=%d", val, seq_access_num, seq_num);
+    } else if (score->unk1E == 2) {
+        score->unk1E = 0;
+    } else if (score->unk1F == 2) {
+        static unsigned s_nrpn_attr_log;
+        if (s_nrpn_attr_log < 8) {
+            s_nrpn_attr_log++;
+            INFOF("SEP NRPN VAB attr %d=%d (msb %d) ignored seq=%d tr=%d",
+                  score->fn_idx, val, score->unk1B, seq_access_num, seq_num);
+        }
+        score->unk1F = 0;
+    }
+    score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
 }
 
 void _SsSetControlChange(
@@ -471,26 +511,28 @@ void _SsGetMetaEvent(
         score->delta_value = _SsReadDeltaValue(seq_access_num, seq_num);
         return;
     case 0x2F:
+        /* Retail end-of-track handler (0x8002F7F4): while passes remain
+         * (l_count 0 = forever) the track restarts from its first event (the
+         * play-from position with SEQ_FLAG_400), not from an NRPN loop start. */
         score->unk21++;
-        if (score->l_count == 0) {
+        if (score->l_count == 0 || (s8)score->unk21 < (s8)score->l_count) {
+            u8* start = (score->flags & SEQ_FLAG_400) ? score->loop_pos
+                                                      : score->read_pos;
             score->unk88 = 0;
             score->unk1C = 0;
             score->delta_value = 0;
-            score->seq_ptr = score->next_sep_pos;
-            return;
-        }
-        if (score->unk21 < score->l_count) {
-            score->unk88 = 0;
-            score->unk1C = 0;
-            score->delta_value = 0;
-            score->seq_ptr = score->next_sep_pos;
-            score->loop_pos = score->next_sep_pos;
+            score->seq_ptr = start;
+            if (score->l_count != 0) {
+                score->next_sep_pos = start;
+            }
             return;
         }
         score->flags &= ~(SEQ_FLAG_1 | SEQ_FLAG_2 | SEQ_FLAG_8);
         score->flags |= SEQ_FLAG_200 | SEQ_FLAG_4;
         score->unk22 = 0;
-        score->loop_pos = score->next_sep_pos;
+        /* retail rewinds the play position so SsSepReplay starts over */
+        score->next_sep_pos = (score->flags & SEQ_FLAG_400) ? score->loop_pos
+                                                            : score->read_pos;
         _SsVmSeqKeyOff((s16)(seq_access_num | (seq_num << 8)));
         score->delta_value = score->unk54;
         score->play_mode = SSPLAY_PAUSE;
