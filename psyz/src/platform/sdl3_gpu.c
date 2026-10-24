@@ -1536,11 +1536,21 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     return max_len - len;
 }
 
+// The queued primitives were drawn into the current drawing area: draw them
+// before it changes. UpdateScissor only flushes when the new area is not
+// empty, so a batch followed by an empty area (a layer clipped to nothing)
+// used to be drawn under the empty area, where the gutter pass skips it.
 void Draw_SetAreaStart(int x, int y) {
+    if (x != draw_area_start.x || y != draw_area_start.y) {
+        Draw_FlushBuffer();
+    }
     draw_area_start.x = x;
     draw_area_start.y = y;
 }
 void Draw_SetAreaEnd(int x, int y) {
+    if (x != draw_area_end.x || y != draw_area_end.y) {
+        Draw_FlushBuffer();
+    }
     draw_area_end.x = x;
     draw_area_end.y = y;
     UpdateScissor();
