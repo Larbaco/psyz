@@ -40,7 +40,6 @@ static void ReadPadsOnVsync(void) {
             Psyz_PadsGet(p, pad_buffers[p], pad_buffer_lens[p]);
         }
     }
-    pads_sampled = 0;
 }
 
 static PsyzVSyncCb g_PsyzVsyncCb = NULL;
