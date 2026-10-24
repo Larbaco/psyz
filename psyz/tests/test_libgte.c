@@ -275,6 +275,54 @@ ZTEST(gte, mul_matrix_permutation) {
     zexpect_matrix_eq(&exp, &a);
 }
 
+ZTEST(gte, set_mul_matrix_identity) {
+    MATRIX a = {{{0x1000, 0, 0}, {0, 0x1000, 0}, {0, 0, 0x1000}}, {0, 0, 0}};
+    MATRIX b = {{{0x0100, 0x0200, 0x0300},
+                 {0x0400, 0x0500, 0x0600},
+                 {0x0700, 0x0800, 0x0900}},
+                {1, 2, 3}};
+    MATRIX exp_a = a, exp_b = b, read;
+    zexpect_ptr_eq(&a, SetMulMatrix(&a, &b));
+    zexpect_matrix_eq(&exp_a, &a);
+    zexpect_matrix_eq(&exp_b, &b);
+    ReadRotMatrix(&read);
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            zexpect_s16_eq(b.m[i][j], read.m[i][j]);
+        }
+    }
+}
+
+ZTEST(gte, set_mul_matrix_general) {
+    MATRIX a = {{{0x0800, 0x0400, 0}, {0, 0x1000, 0x0800}, {0x1000, 0, 0x0400}},
+                {0, 0, 0}};
+    MATRIX b = {
+        {{0x1000, 0x0200, 0}, {0x0800, 0x1000, 0x0400}, {0, 0x0600, 0x1000}},
+        {0, 0, 0}};
+    MATRIX t = {{{0}}, {7, 8, 9}};
+    MATRIX exp = {{{0x0A00, 0x0500, 0x0100},
+                   {0x0800, 0x1300, 0x0C00},
+                   {0x1000, 0x0380, 0x0400}},
+                  {7, 8, 9}};
+    MATRIX read;
+    SetTransMatrix(&t);
+    SetMulMatrix(&a, &b);
+    ReadRotMatrix(&read);
+    zexpect_matrix_eq(&exp, &read);
+}
+
+ZTEST(gte, set_mul_matrix_saturates) {
+    MATRIX a = {{{0x7FFF, 0x7FFF, 0}, {-0x8000, -0x8000, 0}, {0, 0, 0x1000}},
+                {0, 0, 0}};
+    MATRIX b = {{{0x7FFF, 0, 0}, {0x7FFF, 0, 0}, {0, 0, 0x1000}}, {0, 0, 0}};
+    MATRIX exp = {{{0x7FFF, 0, 0}, {-0x8000, 0, 0}, {0, 0, 0x1000}}, {0, 0, 0}};
+    MATRIX read;
+    SetTransMatrix(&b);
+    SetMulMatrix(&a, &b);
+    ReadRotMatrix(&read);
+    zexpect_matrix_eq(&exp, &read);
+}
+
 ZTEST(gte, comp_matrix_rotates_and_translates) {
     MATRIX m0 = {{{0, -0x1000, 0}, {0x1000, 0, 0}, {0, 0, 0x1000}},
                  {100, 200, 300}};
