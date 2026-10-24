@@ -331,6 +331,16 @@ static void RasterTriangle(
     int max_y = CLAMP(Max3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
     min_y = CLAMP(min_y, 0, VRAM_H - 1);
     max_y = CLAMP(max_y, 0, VRAM_H - 1);
+    // Only rows that pass PixelPtr's y test can be written: the clamps above
+    // still leave row 511 when the area starts at y >= 512 (or row 0 when it
+    // ends above 0), and an inverted area keeps rows. Those rows write nothing
+    // through PixelPtr, so dropping them here keeps the pixels the same.
+    if (min_y < draw_area_start.y) {
+        min_y = draw_area_start.y;
+    }
+    if (max_y > draw_area_end.y) {
+        max_y = draw_area_end.y;
+    }
     int abr = (tpage >> 5) & 3;
     // Per row, the edge functions step by a constant per column, and the
     // covered columns are one run (each edge test passes on a half-line of
@@ -370,8 +380,8 @@ static void RasterTriangle(
         int64_t eb = Edge(&c, &a, px2, py2);
         int64_t ec = Edge(&a, &b, px2, py2);
         bool hit = false;
-        // rows here pass PixelPtr's y test (min_y..max_y are clamped to the
-        // area and VRAM), and RowRuns are PixelPtr's columns
+        // rows here pass PixelPtr's y test (min_y..max_y lie in the area and
+        // in VRAM, see above), and RowRuns are PixelPtr's columns
         RowRun runs[3];
         int nruns = RowRuns(y, runs);
         int run = 0;
