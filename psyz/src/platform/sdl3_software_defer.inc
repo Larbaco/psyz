@@ -147,11 +147,11 @@ static void DefLoad(const DefSnap* s, bool gutters) {
 // ---- layers
 
 #define DEF_MAX_LAYERS 12
-#define DEF_MAX_WORDS (1u << 20)
+#define DEF_MAX_WORDS (1u << 16) // words per layer; a full layer is closed
 #define DEF_MAX_SNAPS 60000
 #define DEF_MAX_SRCR 32
 #define DEF_UNDO_MAX_PX (1 << 16)      // one saved rectangle
-#define DEF_UNDO_MAX_TOTAL_PX (1 << 18) // all of a layer's
+#define DEF_UNDO_MAX_TOTAL_PX (1 << 17) // all of a layer's
 
 // The VRAM under a rectangle as it was before an image op overwrote it. A
 // layer that reads the rectangle keeps this instead of being drawn first: when
@@ -238,6 +238,11 @@ static void DefLayerFree(DefLayer* l) {
     }
     l->nundo = 0;
     l->undo_px = 0;
+    if (l->cap > (1u << 14)) { // do not keep a big buffer around
+        free(l->buf);
+        l->buf = NULL;
+        l->cap = 0;
+    }
     l->used = false;
     l->len = 0;
     l->nsnaps = 0;
