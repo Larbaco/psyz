@@ -532,6 +532,13 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
 
 static void UpdateScissor(void);
 
+// whether the drawing area has no pixels (width or height <= 0, i.e. an end
+// before the start); primitives drawn under it are discarded
+static bool DrawAreaEmpty(void) {
+    return draw_area_end.x < draw_area_start.x ||
+           draw_area_end.y < draw_area_start.y;
+}
+
 // whether the current drawing area spans the display's columns, which takes
 // the gutters; any band of rows does (a banner closing from top and bottom)
 static bool GutterActive(void) {
@@ -1094,7 +1101,8 @@ static void UpdateScissor() {
     int height = draw_area_end.y - draw_area_start.y + 1;
     if (width <= 0 || height <= 0) {
         // Draw_SetAreaStart gets called before Draw_SetAreaEnd, it happens
-        // that either width or height are zero. Just ignore the call.
+        // that either width or height are zero. Keep the last scissor (it is
+        // not used while the area is empty: Draw_FlushBuffer drops the batch).
         return;
     }
 
@@ -1797,6 +1805,13 @@ static void DrawBatch(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* texture,
 
 void Draw_FlushBuffer(void) {
     if (n_vertices == 0) {
+        return;
+    }
+    if (DrawAreaEmpty()) {
+        // An empty drawing area (end before start, e.g. a layer clipped to
+        // 0x0) draws nothing, as on the PS1 and in the software rasterizer.
+        // Do not fall back to the last non-empty scissor.
+        Draw_ResetBuffer();
         return;
     }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
