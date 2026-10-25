@@ -1,5 +1,6 @@
 #include <psyz.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../internal.h"
@@ -24,7 +25,11 @@ typedef struct {
 static u16 vram[VRAM_W * VRAM_H];
 static bool dither_enabled;
 
+static int def_dither_override = -1; // a queued primitive's own dither state
 static int SoftwareDither(void) {
+    if (def_dither_override >= 0) {
+        return def_dither_override;
+    }
     return dither_enabled && Psyz_VideoGetDitheringMode() != PSYZ_DITHER_OFF;
 }
 static Point draw_offset;
@@ -693,7 +698,7 @@ static void Software_SetMask(int bit0, int bit1) {
     preserve_masked = bit1 != 0;
 }
 
-static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+static void Software_ClearImageNow(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     u16 color = PackColor(r >> 3, g >> 3, b >> 3, set_mask_bit);
     int x0 = CLAMP(rect->x, 0, VRAM_W);
     int y0 = CLAMP(rect->y, 0, VRAM_H);
@@ -713,7 +718,7 @@ static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     }
 }
 
-static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
+static void Software_LoadImageNow(PS1_RECT* rect, u_long* data) {
     if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
@@ -737,7 +742,7 @@ static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
     }
 }
 
-static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
+static void Software_StoreImageNow(PS1_RECT* rect, u_long* data) {
     if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
@@ -762,7 +767,7 @@ static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
     }
 }
 
-static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
+static void Software_MoveImageNow(PS1_RECT* rect, unsigned int x, unsigned int y) {
     int src_x = CLAMP(rect->x, 0, VRAM_W - 1);
     int src_y = CLAMP(rect->y, 0, VRAM_H - 1);
     int dst_x = CLAMP((int)x, 0, VRAM_W - 1);
@@ -782,7 +787,7 @@ static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     }
 }
 
-static int Software_PushPrim(u_long* words, int max_len) {
+static int Software_PushPrimNow(u_long* words, int max_len) {
     if (max_len <= 0) {
         return 0;
     }
@@ -906,7 +911,10 @@ static int Software_PushPrim(u_long* words, int max_len) {
     return 1;
 }
 
+#include "sdl3_software_defer.inc"
+
 void SoftwareRasterizer_Reset(void) {
+    DefDiscardAll();
     memset(vram, 0, sizeof(vram));
     Software_Reset();
     memset(gutter_planes, 0, sizeof(gutter_planes));
@@ -918,10 +926,20 @@ void SoftwareRasterizer_Reset(void) {
     dither_enabled = false;
 }
 
-const u16* SoftwareRasterizer_GetVram(void) { return vram; }
+const u16* SoftwareRasterizer_GetVram(void) {
+    DefSyncAll();
+    return vram;
+}
+
+const u16* SoftwareRasterizer_GetVramRaw(void) { return vram; }
 
 void SoftwareRasterizer_SetGutter(int px, int x0, int w, int h) {
     px = CLAMP(px, 0, PSYZ_GUTTER_MAX);
+    if (px == gutter_px && x0 == gutter_x0 && w == gutter_w) {
+        (void)h;
+        return; // the flip repeats it every frame; nothing changes
+    }
+    DefSyncAll(); // queued primitives belong to the old gutters
     if (px != gutter_px) {
         FillGutterRows(0, VRAM_H, 0);
     }
@@ -935,10 +953,20 @@ void SoftwareRasterizer_SetGutter(int px, int x0, int w, int h) {
 int SoftwareRasterizer_GetGutter(void) { return gutter_px; }
 
 const u16* SoftwareRasterizer_GetGutterPlane(int side) {
+    DefSyncAll();
+    return gutter_planes[side ? 1 : 0];
+}
+
+const u16* SoftwareRasterizer_GetGutterPlaneRaw(int side) {
     return gutter_planes[side ? 1 : 0];
 }
 
 void SoftwareRasterizer_ClearGutterRows(int y0, int y1) {
+    if (def_n) {
+        DefOpDesc o = {.nr = 0, .w = IR_EMPTY, .gw0 = CLAMP(y0, 0, VRAM_H),
+                       .gw1 = CLAMP(y1, 0, VRAM_H) - 1};
+        DefOp(&o);
+    }
     FillGutterRows(y0, y1, 0);
 }
 
