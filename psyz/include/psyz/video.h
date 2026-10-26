@@ -228,6 +228,29 @@ int Psyz_VideoSetGutter(unsigned px);
 unsigned Psyz_VideoGetGutter(void);
 
 /**
+ * @brief Copy the side gutters of the display into VRAM, beside a MoveImage copy
+ *
+ * The gutters do not live in VRAM, so MoveImage of the displayed framebuffer
+ * leaves them behind. After `MoveImage(&{displayX, src_y, displayW, h}, dx, dy)`
+ * this copies the gutter columns of rows [src_y, src_y + h) to VRAM rows
+ * [dy, dy + h): the left gutter to columns [dx - px, dx) and the right gutter
+ * to [dx + displayW, dx + displayW + px), where px is the gutter width and
+ * displayW the width the gutter was set for. Together with the copy they are
+ * one contiguous (displayW + 2 * px) wide image a textured primitive can
+ * sample. Queued drawing that could change the rows is drawn first. Nothing
+ * happens (0 is returned) with the gutter off, so a game can call it
+ * unconditionally.
+ *
+ * @param src_y first VRAM row of the displayed framebuffer to take
+ * @param h number of rows
+ * @param dx destination column of the MoveImage copy
+ * @param dy destination row of the MoveImage copy
+ * @return the gutter width copied per side, 0 when there is none, -1 if the
+ *         target cannot do it or the strips would leave VRAM
+ */
+int Psyz_VideoCopyGutters(int src_y, int h, int dx, int dy);
+
+/**
  * @brief Synchronize with vertical blank
  *
  * Synchronize with the refresh rate mode set in Psyz_VideoSetVsyncMode.

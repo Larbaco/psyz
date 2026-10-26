@@ -59,5 +59,9 @@ int SoftwareRasterizer_GetGutter(void);
 const u16* SoftwareRasterizer_GetGutterPlane(int side);
 const u16* SoftwareRasterizer_GetGutterPlaneRaw(int side);
 void SoftwareRasterizer_ClearGutterRows(int y0, int y1);
+// Psyz_VideoCopyGutters: the gutter columns of VRAM rows [src_y, src_y + h)
+// into VRAM rows [dy, dy + h), left of dx and right of dx + gutter width.
+// Returns the gutter width per side, 0 with no gutter, -1 out of VRAM.
+int SoftwareRasterizer_CopyGutters(int src_y, int h, int dx, int dy);
 
 #endif

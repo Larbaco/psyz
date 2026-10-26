@@ -1154,6 +1154,57 @@ int Psyz_VideoSetGutter(unsigned px) {
     return 0;
 }
 
+// The gutter columns of the displayed framebuffer's rows [src_y, src_y + h)
+// into VRAM beside a MoveImage copy at (dx, dy); see Psyz_VideoCopyGutters.
+// gutter_render holds the display shifted right by gutter_px, so its columns
+// [0, px) and [px + width, 2 * px + width) are the gutters of the same rows.
+int Psyz_VideoCopyGutters(int src_y, int h, int dx, int dy) {
+    if (gutter_px == 0) {
+        return 0;
+    }
+    const int px = (int)gutter_px;
+    const int w = display_size.x;
+    if (h <= 0 || src_y < 0 || dy < 0 || src_y + h > VRAM_H ||
+        dy + h > VRAM_H || dx - px < 0 || dx + w + px > VRAM_W) {
+        return -1;
+    }
+    if (!device || !vram_render) {
+        return -1;
+    }
+    SDL_GPUTexture* gutters = GetGutterTarget();
+    if (!gutters) {
+        return -1;
+    }
+    Draw_FlushBuffer(); // the queued primitives belong to these rows
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (!cmd) {
+        return -1;
+    }
+    const Uint32 n = internal_res;
+    for (int side = 0; side < 2; side++) {
+        const int sx = side ? px + w : 0;
+        const int vx = side ? dx + w : dx - px;
+        const SDL_GPUBlitInfo blit = {
+            .source = {.texture = gutters,
+                       .x = (Uint32)sx * n,
+                       .y = (Uint32)src_y * n,
+                       .w = (Uint32)px * n,
+                       .h = (Uint32)h * n},
+            .destination = {.texture = vram_render,
+                            .x = (Uint32)vx,
+                            .y = (Uint32)dy,
+                            .w = (Uint32)px,
+                            .h = (Uint32)h},
+            .load_op = SDL_GPU_LOADOP_LOAD,
+            .filter = SDL_GPU_FILTER_NEAREST,
+        };
+        SDL_BlitGPUTexture(cmd, &blit);
+        MarkVramDirty((SDL_Rect){vx, dy, px, h});
+        SyncNativeVramToScaled(vx, dy, px, h);
+    }
+    return px;
+}
+
 static void ApplyDisplayPendingChanges() {
     if (!sdl3_window && !InitPlatform()) {
         return;

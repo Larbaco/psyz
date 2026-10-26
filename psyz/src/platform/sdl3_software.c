@@ -970,6 +970,28 @@ void SoftwareRasterizer_ClearGutterRows(int y0, int y1) {
     FillGutterRows(y0, y1, 0);
 }
 
+int SoftwareRasterizer_CopyGutters(int src_y, int h, int dx, int dy) {
+    if (gutter_px <= 0) {
+        return 0;
+    }
+    if (h <= 0 || src_y < 0 || dy < 0 || src_y + h > VRAM_H ||
+        dy + h > VRAM_H || dx - gutter_px < 0 ||
+        dx + gutter_w + gutter_px > VRAM_W) {
+        return -1;
+    }
+    // the rows of the planes, and the VRAM the strips overwrite, as immediate
+    // drawing leaves them
+    DefSyncAll();
+    for (int row = 0; row < h; row++) {
+        const u16* l = &gutter_planes[0][(src_y + row) * PSYZ_GUTTER_MAX];
+        const u16* r = &gutter_planes[1][(src_y + row) * PSYZ_GUTTER_MAX];
+        u16* d = &vram[(dy + row) * VRAM_W];
+        memcpy(&d[dx - gutter_px], l, (size_t)gutter_px * sizeof(u16));
+        memcpy(&d[dx + gutter_w], r, (size_t)gutter_px * sizeof(u16));
+    }
+    return gutter_px;
+}
+
 static void Software_FlushBuffer(void) {}
 static void Software_ResetBuffer(void) {}
 static int Software_ExequeSync(void) { return 0; }
