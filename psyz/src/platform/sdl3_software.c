@@ -272,6 +272,21 @@ static u16 ShadeTexel(
     return PackColor(tr, tg, tb, (texel & 0x8000) != 0);
 }
 
+// ShadeTexel(texel, 128, 128, 128, false, x, y, true) without the arithmetic:
+// the modulation is tr * 8 (at most 248), so adding the dither d in -4..3 and
+// shifting by 3 gives tr, or tr - 1 (at least 0) where d < 0, per channel.
+// 1 bits mark the dither cells with d < 0, indexed by (y & 3) * 4 + (x & 3).
+#define DITHER_NEG_CELLS 0xa5a5 // rows {-4,0,-3,1} {2,-2,3,-1} {-3,1,-4,0} {3,-1,2,-2}
+static inline u16 DitherNeutralTexel(u16 texel, int x, int y) {
+    u16 m = texel & 0x7fff;
+    if ((DITHER_NEG_CELLS >> (((y & 3) << 2) | (x & 3))) & 1) {
+        // bit 0 of each channel: set when the channel is not zero
+        u16 nz = (u16)((m | (m >> 1) | (m >> 2) | (m >> 3) | (m >> 4)) & 0x0421);
+        m = (u16)(m - nz);
+    }
+    return (u16)(m | (texel & 0x8000));
+}
+
 static int64_t Edge(const SwVertex* a, const SwVertex* b, int px2, int py2) {
     return (int64_t)(px2 - a->x * 2) * (b->y - a->y) -
            (int64_t)(py2 - a->y * 2) * (b->x - a->x);
@@ -290,6 +305,9 @@ static bool IsTopLeft(const SwVertex* a, const SwVertex* b) {
 // attributes are >= 0), so q equals the truncating division it replaces.
 typedef struct {
     int64_t q, r, dq, dr;
+    // the step to the same column of the next row, and the value at the first
+    // covered column of the previous row (see RowLerpNext)
+    int64_t dqy, dry, sq, sr;
 } RowLerp;
 
 // the step to the next column, once per triangle
@@ -298,10 +316,40 @@ static inline void RowLerpInit(RowLerp* l, int64_t dn, int denom) {
     l->dr = dn % denom;
 }
 
+// the step to the next row, once per triangle
+static inline void RowLerpInitRow(RowLerp* l, int64_t dn, int denom) {
+    l->dqy = dn / denom;
+    l->dry = dn % denom;
+}
+
 // the value at the first covered column of a row
 static inline void RowLerpStart(RowLerp* l, int64_t n, int denom) {
     l->q = n / denom;
     l->r = n % denom;
+    l->sq = l->q;
+    l->sr = l->r;
+}
+
+// The value at the first covered column of the next row, from the one of the
+// previous row: dk columns over and one row down, with the remainder brought
+// back into [0, denom) by adds (dk is small). It is the same quotient and
+// remainder RowLerpStart gives, without its divisions.
+static inline void RowLerpNext(RowLerp* l, int dk, int denom) {
+    int64_t q = l->sq + l->dqy + l->dq * dk;
+    int64_t r = l->sr + l->dry + l->dr * dk;
+
+    while (r >= denom) {
+        r -= denom;
+        q++;
+    }
+    while (r < 0) {
+        r += denom;
+        q--;
+    }
+    l->q = q;
+    l->r = r;
+    l->sq = q;
+    l->sr = r;
 }
 
 static inline void RowLerpStep(RowLerp* l, int denom) {
@@ -313,6 +361,70 @@ static inline void RowLerpStep(RowLerp* l, int denom) {
     } else if (l->r < 0) {
         l->r += denom;
         l->q--;
+    }
+}
+
+// One edge function e0 + s * k (k = column offset from min_x; e0 is the value
+// at min_x of the current row) passes where s * k <= lim - e0, lim being 0 on
+// a top or left edge and -1 otherwise (below zero, or zero on a top or left
+// edge). With d = |s| and q = floor((lim - e0) / d) that is k <= q for s > 0
+// and k >= -q for s < 0, and for s == 0 all k or none. q follows the rows
+// without a division: e0 moves by a constant per row, so q and the remainder
+// rem = (lim - e0) - q * d move by a constant quotient and remainder.
+typedef struct {
+    int64_t d, lim, q, rem, dq, drem;
+    int kind; // 0: s == 0, 1: s > 0 (upper bound), 2: s < 0 (lower bound)
+} SpanEdge;
+
+static inline int64_t FloorDiv(int64_t n, int64_t d) { // d > 0
+    int64_t q = n / d;
+    return (n % d < 0) ? q - 1 : q;
+}
+
+// row_step: how much e0 changes from one row to the next
+static void SpanEdgeInit(SpanEdge* e, int64_t s, bool tl, int64_t row_step) {
+    e->lim = tl ? 0 : -1;
+    e->kind = s == 0 ? 0 : (s > 0 ? 1 : 2);
+    e->d = s < 0 ? -s : s;
+    if (e->kind) {
+        e->dq = FloorDiv(-row_step, e->d);
+        e->drem = -row_step - e->dq * e->d;
+    }
+}
+
+static inline void SpanEdgeStart(SpanEdge* e, int64_t e0) {
+    if (e->kind) {
+        int64_t r = e->lim - e0;
+
+        e->q = FloorDiv(r, e->d);
+        e->rem = r - e->q * e->d;
+    }
+}
+
+static inline void SpanEdgeNext(SpanEdge* e) {
+    if (e->kind) {
+        e->q += e->dq;
+        e->rem += e->drem;
+        if (e->rem >= e->d) {
+            e->rem -= e->d;
+            e->q++;
+        }
+    }
+}
+
+// Narrows [*klo, *khi] by the edge at e0.
+static inline void SpanEdgeApply(const SpanEdge* e, int64_t e0, int64_t* klo,
+                                 int64_t* khi) {
+    if (e->kind == 1) {
+        if (e->q < *khi) {
+            *khi = e->q;
+        }
+    } else if (e->kind == 2) {
+        if (-e->q > *klo) {
+            *klo = -e->q;
+        }
+    } else if (e->lim - e0 < 0) {
+        *khi = *klo - 1;
     }
 }
 
@@ -356,6 +468,9 @@ static void RasterTriangle(
     // ShadeTexel returns the texel as it is: raw, or flat neutral undithered
     bool keep_texel = raw_texture || (!gouraud && !dith && a.r == 128 &&
                                       a.g == 128 && a.b == 128);
+    // the common textured case with dither on: a neutral color (128)
+    bool neutral_dither = textured && dith && !raw_texture && !gouraud &&
+                          a.r == 128 && a.g == 128 && a.b == 128;
     bool top_left_a = IsTopLeft(&b, &c);
     bool top_left_b = IsTopLeft(&c, &a);
     bool top_left_c = IsTopLeft(&a, &b);
@@ -378,42 +493,97 @@ static void RasterTriangle(
         RowLerpInit(&lv, DW(v), denom);
     }
 #undef DW
+    // the edge functions and the weights also step by a constant per row
+    int64_t row_a = 2 * (int64_t)(b.x - c.x);
+    int64_t row_b = 2 * (int64_t)(c.x - a.x);
+    int64_t row_c = 2 * (int64_t)(a.x - b.x);
+#define DWY(p) (-row_a * a.p - row_b * b.p - row_c * c.p)
+    if (lerp && gouraud) {
+        RowLerpInitRow(&lr, DWY(r), denom);
+        RowLerpInitRow(&lg, DWY(g), denom);
+        RowLerpInitRow(&lb, DWY(b), denom);
+    }
+    if (lerp && textured) {
+        RowLerpInitRow(&lu, DWY(u), denom);
+        RowLerpInitRow(&lv, DWY(v), denom);
+    }
+#undef DWY
+    SpanEdge span_a, span_b, span_c;
+    SpanEdgeInit(&span_a, step_a, top_left_a, row_a);
+    SpanEdgeInit(&span_b, step_b, top_left_b, row_b);
+    SpanEdgeInit(&span_c, step_c, top_left_c, row_c);
+    int prev_start_y = -2; // the row whose first covered column lr..lv hold
+    int prev_start_x = 0;
     for (int y = min_y; y <= max_y; y++) {
         int px2 = min_x * 2 + centered;
         int py2 = y * 2 + centered;
         int64_t ea = Edge(&b, &c, px2, py2);
         int64_t eb = Edge(&c, &a, px2, py2);
         int64_t ec = Edge(&a, &b, px2, py2);
+        if (y == min_y) {
+            SpanEdgeStart(&span_a, ea);
+            SpanEdgeStart(&span_b, eb);
+            SpanEdgeStart(&span_c, ec);
+        } else {
+            SpanEdgeNext(&span_a);
+            SpanEdgeNext(&span_b);
+            SpanEdgeNext(&span_c);
+        }
         bool hit = false;
         // rows here pass PixelPtr's y test (min_y..max_y lie in the area and
         // in VRAM, see above), and RowRuns are PixelPtr's columns
         RowRun runs[3];
         int nruns = RowRuns(y, runs);
         int run = 0;
-        for (int x = min_x; x <= max_x;
+        // The covered columns of this row are the k in [klo, khi] (x = min_x
+        // + k) where all three edge functions pass: each is linear in k, so
+        // each bounds k from one side. The same columns the per-column test
+        // finds (it hits a contiguous run), without visiting the misses.
+        int64_t klo = 0;
+        int64_t khi = (int64_t)max_x - min_x;
+        SpanEdgeApply(&span_a, ea, &klo, &khi);
+        SpanEdgeApply(&span_b, eb, &klo, &khi);
+        SpanEdgeApply(&span_c, ec, &klo, &khi);
+        if (klo > khi) {
+            continue;
+        }
+        ea += step_a * klo;
+        eb += step_b * klo;
+        ec += step_c * klo;
+        for (int x = min_x + (int)klo; x <= min_x + (int)khi;
              x++, ea += step_a, eb += step_b, ec += step_c) {
-            if (ea > 0 || (ea == 0 && !top_left_a) || eb > 0 ||
-                (eb == 0 && !top_left_b) || ec > 0 ||
-                (ec == 0 && !top_left_c)) {
-                if (hit) {
-                    break;
-                }
-                continue;
-            }
             int64_t wa = -ea;
             int64_t wb = -eb;
             int64_t wc = -ec;
 #define WN(p) (wa * a.p + wb * b.p + wc * c.p)
             if (lerp && !hit) {
+                // from the previous row's start when it is the row above and
+                // the start moved only a few columns, else by division
+                int dk = x - prev_start_x;
+                bool next = prev_start_y == y - 1 && dk >= -3 && dk <= 3;
+
                 if (gouraud) {
-                    RowLerpStart(&lr, WN(r), denom);
-                    RowLerpStart(&lg, WN(g), denom);
-                    RowLerpStart(&lb, WN(b), denom);
+                    if (next) {
+                        RowLerpNext(&lr, dk, denom);
+                        RowLerpNext(&lg, dk, denom);
+                        RowLerpNext(&lb, dk, denom);
+                    } else {
+                        RowLerpStart(&lr, WN(r), denom);
+                        RowLerpStart(&lg, WN(g), denom);
+                        RowLerpStart(&lb, WN(b), denom);
+                    }
                 }
                 if (textured) {
-                    RowLerpStart(&lu, WN(u), denom);
-                    RowLerpStart(&lv, WN(v), denom);
+                    if (next) {
+                        RowLerpNext(&lu, dk, denom);
+                        RowLerpNext(&lv, dk, denom);
+                    } else {
+                        RowLerpStart(&lu, WN(u), denom);
+                        RowLerpStart(&lv, WN(v), denom);
+                    }
                 }
+                prev_start_y = y;
+                prev_start_x = x;
             } else if (lerp) {
                 if (gouraud) {
                     RowLerpStep(&lr, denom);
@@ -446,9 +616,14 @@ static void RasterTriangle(
                     continue;
                 }
                 blend = semi && (texel & 0x8000);
-                color = keep_texel ? texel
-                                   : ShadeTexel(texel, r, g, blue, raw_texture,
-                                                x, y, dith && !raw_texture);
+                if (keep_texel) {
+                    color = texel;
+                } else if (neutral_dither) {
+                    color = DitherNeutralTexel(texel, x, y);
+                } else {
+                    color = ShadeTexel(texel, r, g, blue, raw_texture, x, y,
+                                       dith && !raw_texture);
+                }
             } else {
                 int d = dith && gouraud ? dither[y & 3][x & 3] : 0;
                 color = PackColor(
