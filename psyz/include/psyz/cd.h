@@ -65,6 +65,20 @@ size_t Psyz_CdPullSamples(short* out, size_t num_frames);
  */
 void Psyz_CdSetReadCB(PsyzCdReadCB cb);
 
+/**
+ * @brief Pump STR stream: honor StCdIntrFlag and feed sectors into the ring.
+ *
+ * Call from the host VSync path and from StGetNext waits. No-op when
+ * CdlModeStream is inactive.
+ */
+void Psyz_CdPumpStream(void);
+
+/** Latch set by CdRead2 when CdlModeStream is requested (bit does not fit u8). */
+void Psyz_CdSetStreamActive(int active);
+
+/** Non-zero when a Psyz_CdSetReadCB file bridge is installed. */
+int Psyz_CdFileBridgeActive(void);
+
 #ifdef __cplusplus
 }
 #endif

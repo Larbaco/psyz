@@ -14,6 +14,15 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
 
 unsigned Psyz_VideoGetInternalResolution(void) { return 1; }
 
+int Psyz_VideoSetGutter(unsigned px) { return px == 0 ? 0 : -1; }
+
+unsigned Psyz_VideoGetGutter(void) { return 0; }
+
+int Psyz_VideoCopyGutters(int src_y, int h, int dx, int dy) {
+    (void)src_y; (void)h; (void)dx; (void)dy;
+    return 0;
+}
+
 int Draw_SetHorizontalGrid(
     unsigned int source_width, unsigned int target_width) {
     if (source_width == 0 || target_width == 0) {

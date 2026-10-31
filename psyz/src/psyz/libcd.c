@@ -1,6 +1,7 @@
 #include <psyz.h>
 #include <libetc.h>
 #include <libcd.h>
+#include <libpress.h>
 #include <psyz/log.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -8,8 +9,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <time.h>
 #include <kernel.h>
 #include "../internal.h"
+#include "../../decomp/src/libcd/libcd_stream.h"
 #include "../../decomp/src/libspu/libspu_private.h"
 
 #define SECTOR_SIZE 2352
@@ -344,6 +347,9 @@ static int data_read_active = 0;
 static int data_sector_valid = 0;
 static int data_sector_number = 0;
 static int data_getsector_count = 0;
+/* Rearmed on each CdlReadN/S. The pump paces from this so a new movie does
+ * not inherit leftover sector credit. */
+static int stream_pace_reset = 1;
 
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
 // param = 0x00. Equals the absolute sector where the last track's file ends.
@@ -388,7 +394,10 @@ int Psyz_CdSetDiskPath(const char* diskPath) {
 }
 
 static PsyzCdReadCB disk_read_cb = NULL;
+static int stream_active = 0;
 void Psyz_CdSetReadCB(PsyzCdReadCB cb) { disk_read_cb = cb; }
+int Psyz_CdFileBridgeActive(void) { return disk_read_cb != NULL; }
+void Psyz_CdSetStreamActive(int active) { stream_active = active ? 1 : 0; }
 
 #define N_CHANNELS 2
 #define SAMPLE_SIZE sizeof(short)
@@ -570,15 +579,32 @@ static int xa_decode_user_mono_4bit(const unsigned char* user) {
     return frame;
 }
 
+/* Read one absolute 2352-byte sector for XA. File bridge (Psyz_CdSetReadCB)
+ * is preferred so packed runtime STR works without a cue/bin track_file. */
+static int xa_read_raw_sector(int abs_sector, unsigned char* sector) {
+    if (disk_read_cb) {
+        struct PsyzCdRead read = {
+            (unsigned int)abs_sector, SECTOR_SIZE, sector};
+        return disk_read_cb(&read) < 0 ? -1 : 0;
+    }
+    if (!track_file) {
+        return -1;
+    }
+    if (fread(sector, 1, SECTOR_SIZE, track_file) != SECTOR_SIZE) {
+        return -1;
+    }
+    return 0;
+}
+
 static int xa_read_and_decode_sector(void) {
     unsigned char sector[SECTOR_SIZE];
     int gap = 0;
     while (!xa.stream_ended) {
-        const size_t n = fread(sector, 1, SECTOR_SIZE, track_file);
-        if (n != SECTOR_SIZE) {
+        const int next = xa.cur_abs_sector + 1;
+        if (xa_read_raw_sector(next, sector) != 0) {
             return 0; // EOF or short read
         }
-        xa.cur_abs_sector++;
+        xa.cur_abs_sector = next;
         const unsigned char file = sector[0x10];
         const unsigned char channel = sector[0x11];
         const unsigned char submode = sector[0x12];
@@ -604,6 +630,18 @@ static int xa_read_and_decode_sector(void) {
             xa.decoded_count = xa_decode_user_mono_4bit(user);
         }
         xa.decoded_pos = 0;
+        {
+            static int xa_sectors_decoded;
+            if (xa_sectors_decoded < 1) {
+                fprintf(stderr,
+                        "psyz-xa: decoded sector %d file=%u chan=%u "
+                        "submode=0x%02x ci=0x%02x frames=%d (%s)\n",
+                        next, (unsigned)file, (unsigned)channel,
+                        (unsigned)submode, (unsigned)ci, xa.decoded_count,
+                        disk_read_cb ? "file-bridge" : "track-file");
+                xa_sectors_decoded++;
+            }
+        }
         return 1;
     }
     memset(xa.decoded, 0, sizeof(xa.decoded));
@@ -656,7 +694,8 @@ static size_t xa_pull_samples(short* buf, size_t max_frames) {
     size_t written = 0;
     int hit_eof = 0;
     Psyz_AudioLock();
-    if (!is_playing || !track_file || !xa.active) {
+    /* track_file is optional when Psyz_CdSetReadCB serves sectors. */
+    if (!is_playing || !xa.active || (!track_file && !disk_read_cb)) {
         goto end;
     }
     // Prime Hermite ring on first call so we have y0..y2 valid.
@@ -749,6 +788,13 @@ static int open_track_at_cd_pos(void) {
     int sector = CdPosToInt(&CD_pos);
     TrackEntry* track = find_track_for_sector(sector);
     if (!track) {
+        /* File bridge (packed runtime STR / Psyz_CdSetReadCB) serves LBAs
+         * without a cue/bin track. */
+        if (disk_read_cb) {
+            close_track_file();
+            DEBUGF("file bridge open at sector %d (no cue track)", sector);
+            return 0;
+        }
         WARNF("no track found for sector %d", sector);
         return -1;
     }
@@ -860,6 +906,7 @@ static void psyz_stop() {
     xa.active = 0;
     data_read_active = 0;
     data_sector_valid = 0;
+    stream_active = 0;
     close_track_file();
     cd_buf_pos = 0;
     cd_buf_count = 0;
@@ -872,6 +919,7 @@ static void psyz_pause() {
     xa.active = 0;
     data_read_active = 0;
     data_sector_valid = 0;
+    stream_active = 0;
     Psyz_AudioUnlock();
 }
 
@@ -1037,7 +1085,42 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         break;
     case CdlReadN:
     case CdlReadS:
-        if (CD_mode & CdlModeRT) {
+        /* stream_active is latched by CdRead2: CdlModeStream (0x100) does not
+         * fit in the u8 Setmode parameter, so CD_mode alone is insufficient. */
+        if (stream_active || (CD_mode & CdlModeStream)) {
+            /* STR video path: feed DataReady → StCdInterrupt. RT/XA is
+             * best-effort alongside (Task 4); missing cue must not block. */
+            stream_active = 1;
+            Psyz_AudioLock();
+            need_cdda_rewind = 1;
+            data_sector_number = CdPosToInt(&CD_pos);
+            data_sector_valid = 0;
+            data_getsector_count = 0;
+            data_read_active = 1;
+            stream_pace_reset = 1;
+            CD_status |= CdlStatRead;
+            Psyz_AudioUnlock();
+            if ((CD_mode & CdlModeRT) && open_track_at_cd_pos() == 0 &&
+                (track_file || disk_read_cb)) {
+                Psyz_AudioLock();
+                xa_reset_stream();
+                xa.cur_abs_sector = CdPosToInt(&CD_pos) - 1;
+                xa.active = 1;
+                is_playing = 1;
+                Psyz_AudioUnlock();
+                {
+                    static int xa_stream_logged;
+                    if (xa_stream_logged < 1) {
+                        fprintf(stderr,
+                                "psyz-xa: RT stream active at sector %d via %s\n",
+                                CdPosToInt(&CD_pos),
+                                track_file ? "track-file"
+                                           : "file-bridge");
+                        xa_stream_logged++;
+                    }
+                }
+            }
+        } else if (CD_mode & CdlModeRT) {
             psyz_xa_read();
         } else {
             Psyz_AudioLock();
@@ -1049,6 +1132,7 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             data_sector_valid = 0;
             data_getsector_count = 0;
             data_read_active = 1;
+            stream_pace_reset = 1;
             CD_status |= CdlStatRead;
         }
         break;
@@ -1093,16 +1177,22 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             LOG_ONCE("%s does not support CdlModeSize0", CD_comstr[com]);
         }
         if (*param & CdlModeSize1) {
-            LOG_ONCE("%s does not support CdlModeSize1", CD_comstr[com]);
+            if (!disk_read_cb) {
+                LOG_ONCE("%s does not support CdlModeSize1", CD_comstr[com]);
+            }
         }
         if (*param & CdlModeSpeed) {
             LOG_ONCE("%s does not support CdlModeSpeed", CD_comstr[com]);
         }
         if (*param & CdlModeStream2) {
-            LOG_ONCE("%s does not support CdlModeStream2", CD_comstr[com]);
+            if (!disk_read_cb) {
+                LOG_ONCE("%s does not support CdlModeStream2", CD_comstr[com]);
+            }
         }
         if (*param & CdlModeStream) {
-            LOG_ONCE("%s does not support CdlModeStream", CD_comstr[com]);
+            if (!disk_read_cb) {
+                LOG_ONCE("%s does not support CdlModeStream", CD_comstr[com]);
+            }
         }
         Psyz_AudioLock();
         CD_mode = *param;
@@ -1272,4 +1362,246 @@ int CdReadSync(int mode, u_char* result) {
     return 0;
 }
 
-void StCdInterrupt(void) { NOT_IMPLEMENTED; }
+static void stream_consume_sector(void) {
+    data_sector_valid = 0;
+    data_getsector_count = 0;
+    data_sector_number++;
+}
+
+void StCdInterrupt(void) {
+    u_char result[8];
+    StHEADER* ring;
+    StHEADER hdr;
+    u_long* dst;
+    const u_char* user;
+    int ready;
+    u16 magic;
+    u16 chan;
+
+    if (!StRingAddr || StRingSize <= 0) {
+        return;
+    }
+    if (StFinalSector == 1) {
+        return;
+    }
+    /* Defer when MDEC out DMA is busy (Sony StCdIntrFlag handshake). */
+    if (StRgb24 != 0 && DecDCToutSync(1) != 0) {
+        StCdIntrFlag = 1;
+        return;
+    }
+
+    ready = CdReady(1, result);
+    if (ready == CdlDiskError) {
+        return;
+    }
+    if (ready != CdlDataReady || !data_sector_valid) {
+        return;
+    }
+    if (result[0] & CdlStatShellOpen) {
+        return;
+    }
+
+    /* Size1 / Mode2 user payload starts after sync(12)+header(4)+sub(8). */
+    user = data_sector + 24;
+    memcpy(&hdr, user, sizeof(hdr));
+    magic = hdr.id;
+    chan = (u16)((hdr.type >> 10) & 0x1F);
+
+    /* Skip XA / non-video sectors interleaved in the STR extent. */
+    if (magic != 0x0160 || chan != (u16)StCHANNEL) {
+        stream_consume_sector();
+        return;
+    }
+
+    ring = &StRingAddr[StRingIdx1];
+    /* Ring slot still owned by a prior sector: backpressure — do NOT advance
+     * the CD position. Dropping here desyncs STR (secCount gaps) and stalls
+     * StGetNext after ~ring_size/nSectors frames (~3 for MOVIEOPN). */
+    if (ring->id != 0) {
+        static int ring_full_logs;
+        if (ring_full_logs < 3) {
+            fprintf(stderr,
+                    "dw3-str: ring backpressure idx1=%d id=%u fc=%u sec=%u/%u\n",
+                    StRingIdx1, (unsigned)ring->id, (unsigned)hdr.frameCount,
+                    (unsigned)hdr.secCount, (unsigned)hdr.nSectors);
+            ring_full_logs++;
+        }
+        return;
+    }
+
+    if (StSTART_FLAG != 0 && StStartFrame != 0 &&
+        (u32)hdr.frameCount != (u32)StStartFrame) {
+        stream_consume_sector();
+        return;
+    }
+    if (StSTART_FLAG != 0 && StStartFrame != 0 &&
+        (u32)hdr.frameCount == (u32)StStartFrame) {
+        StSTART_FLAG = 0;
+    }
+
+    if (hdr.secCount != (u_short)Stsector_offset) {
+        init_ring_status(StRingIdx2, (u32)(StRingIdx1 - StRingIdx2));
+        StRingIdx1 = StRingIdx2;
+        Stsector_offset = 0;
+        Stframe_no = 0;
+        stream_consume_sector();
+        return;
+    }
+
+    if (hdr.secCount == 0) {
+        Stsector_offset = 0;
+        Stframe_no = (s32)hdr.frameCount;
+        if (StEndFrame != 0 && (u32)hdr.frameCount >= (u32)StEndFrame) {
+            Stsector_offset = 0;
+            Stframe_no = 0;
+            init_ring_status(StRingIdx2, (u32)(StRingIdx1 - StRingIdx2));
+            StRingIdx1 = StRingIdx2;
+            stream_consume_sector();
+            return;
+        }
+        if ((u32)(StRingSize - StRingIdx1 - 1) < (u32)hdr.nSectors) {
+            if (StRingAddr[0].id != 0) {
+                /* Need wrap but start still occupied — wait for StFreeRing. */
+                static int wrap_full_logs;
+                if (wrap_full_logs < 3) {
+                    fprintf(stderr,
+                            "dw3-str: ring wrap wait idx1=%d need=%u "
+                            "ring0id=%u fc=%u\n",
+                            StRingIdx1, (unsigned)hdr.nSectors,
+                            (unsigned)StRingAddr[0].id,
+                            (unsigned)hdr.frameCount);
+                    wrap_full_logs++;
+                }
+                return;
+            }
+            /* Sony ring: id=1 at the current write index is the end-of-ring
+             * sentinel. StGetNext sees it, resets StRingIdx3 to 0, then takes
+             * the frame at ring[0]. Without this, Idx3 sticks past the last
+             * freed frame (~3×9-sector MOVIEOPN) and decodeNextFrame starves
+             * while DecDCTin keeps replaying the same VLC buffer. */
+            StRingAddr[StRingIdx1].id = 1;
+            StRingIdx1 = 0;
+            ring = &StRingAddr[0];
+        }
+        StRingIdx2 = StRingIdx1;
+    }
+
+    memcpy(ring, &hdr, sizeof(StHEADER));
+    CdIntToPos(data_sector_number, &ring->loc);
+
+    dst = (u_long*)(&StRingAddr[StRingSize] + (StRingIdx1 * 0x3F));
+    memcpy(dst, user + 32, 2016);
+
+    ring->id = 3;
+    Stsector_offset++;
+    StRingIdx1++;
+
+    if ((hdr.nSectors - 1) == hdr.secCount) {
+        StFinalSector = 1;
+        Stsector_offset = 0;
+        Stframe_no = 0;
+        data_ready_callback();
+        {
+            static unsigned frames_ready;
+            frames_ready++;
+            if (frames_ready <= 3u || frames_ready == 10u ||
+                (frames_ready % 30u) == 0u) {
+                fprintf(stderr,
+                        "dw3-str: frame ready #%u fc=%u %ux%u sectors=%u\n",
+                        frames_ready, (unsigned)hdr.frameCount,
+                        (unsigned)hdr.width, (unsigned)hdr.height,
+                        (unsigned)hdr.nSectors);
+            }
+        }
+    }
+
+    stream_consume_sector();
+}
+
+/* PS1 double-speed is 150 sectors/s. VSync and StGetNext both call the pump,
+ * so a fixed 8 sectors per call feeds a 15 fps STR at the display rate and
+ * the picture runs ahead of XA. */
+#define CD_2X_PER_SEC 150u
+#define CD_PACE_CATCHUP 8u
+
+static uint64_t stream_pace_origin_us;
+static uint64_t stream_pace_granted;
+
+static uint64_t stream_mono_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static int stream_pace_budget(void) {
+    uint64_t now, due, budget;
+    if (stream_pace_reset || stream_pace_origin_us == 0) {
+        stream_pace_origin_us = stream_mono_us();
+        stream_pace_granted = 0;
+        stream_pace_reset = 0;
+        return 0;
+    }
+    now = stream_mono_us();
+    if (now < stream_pace_origin_us) {
+        stream_pace_origin_us = now;
+        stream_pace_granted = 0;
+        return 0;
+    }
+    due = ((now - stream_pace_origin_us) * CD_2X_PER_SEC) / 1000000ULL;
+    if (due <= stream_pace_granted) {
+        return 0;
+    }
+    budget = due - stream_pace_granted;
+    if (budget > CD_PACE_CATCHUP) {
+        /* A stall must not dump the rest of the movie on the next call. */
+        stream_pace_granted = due - CD_PACE_CATCHUP;
+        budget = CD_PACE_CATCHUP;
+    }
+    return (int)budget;
+}
+
+void Psyz_CdPumpStream(void) {
+    int i;
+    int budget;
+    int delivered = 0;
+
+    if (!stream_active && !(CD_mode & (CdlModeStream | CdlModeStream2))) {
+        return;
+    }
+    if (StCdIntrFlag) {
+        StCdInterrupt();
+        StCdIntrFlag = 0;
+        stream_pace_granted++;
+        return;
+    }
+    if (!data_read_active) {
+        return;
+    }
+    budget = stream_pace_budget();
+    for (i = 0; i < budget; i++) {
+        StHEADER* probe;
+        int sec_before;
+        int valid_before;
+        if (StFinalSector == 1) {
+            break;
+        }
+        sec_before = data_sector_number;
+        valid_before = data_sector_valid;
+        StCdInterrupt();
+        if (!StRingAddr) {
+            break;
+        }
+        /* No CD advance and sector still latched → ring backpressure.
+         * Leave it uncounted so the next call retries the same sector. */
+        if (data_sector_valid && data_sector_number == sec_before &&
+            valid_before) {
+            break;
+        }
+        delivered++;
+        probe = &StRingAddr[StRingIdx3];
+        if (probe->id == 2 || probe->id == 1) {
+            break;
+        }
+    }
+    stream_pace_granted += (uint64_t)delivered;
+}

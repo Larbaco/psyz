@@ -4,6 +4,9 @@
 
 #ifdef __psyz
 s32 StMode;
+/* CdlModeStream is 0x100 — does not fit in the u8 Setmode param. Host libcd
+ * needs an explicit stream-active latch for ReadS / Psyz_CdPumpStream. */
+void Psyz_CdSetStreamActive(int active);
 #endif
 
 static inline void StCdInterrupt2(u_char intr, u_char* result) {
@@ -21,6 +24,9 @@ int CdRead2(long mode) {
         }
         CdDataCallback(data_ready_callback);
         CdReadyCallback(StCdInterrupt2);
+#ifdef __psyz
+        Psyz_CdSetStreamActive(1);
+#endif
     }
     return CdControl(CdlReadS, NULL, NULL);
 }

@@ -59,20 +59,12 @@ void _SsInit(void) {
 
 // void _SsVmFlush(void) { NOT_IMPLEMENTED; }
 
-void _SsSeqPlay(short arg0, short arg1) { NOT_IMPLEMENTED; }
+/* SEQ/SEP MIDI path: midiread_host.c (sotn-decomp seqread port). */
 
 void _SsSndTempo(short arg0, short arg1) { NOT_IMPLEMENTED; }
 
 void SsSetMarkCallback(
     short access_num, short seq_num, SsMarkCallbackProc proc) {
-    NOT_IMPLEMENTED;
-}
-
-void SsSeqSetDecrescendo(short seq_access_num, short vol, long v_time) {
-    NOT_IMPLEMENTED;
-}
-
-void _SsVmGetSeqVol(short seq_sep_no, short* voll, short* volr) {
     NOT_IMPLEMENTED;
 }
 
@@ -83,32 +75,6 @@ void SetAutoVol(short voice) { NOT_IMPLEMENTED; }
 void SeAutoPan(short arg0, short arg1, short arg2, short arg3) {
     NOT_IMPLEMENTED;
 }
-
-void _SsNoteOn(short a0, short a1, unsigned char a2, unsigned char a3) {
-    NOT_IMPLEMENTED;
-}
-void _SsSetProgramChange(short a0, short a1, unsigned char a2) {
-    NOT_IMPLEMENTED;
-}
-void _SsGetMetaEvent(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsSetPitchBend(short a0, short a1) { NOT_IMPLEMENTED; }
-void _SsSetControlChange(short a0, short a1, unsigned char a2) {
-    NOT_IMPLEMENTED;
-}
-void _SsContBankChange(short a0, short a1) { NOT_IMPLEMENTED; }
-void _SsContDataEntry(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContMainVol(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContPanpot(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContExpression(short a0, short a1, unsigned char a2) {
-    NOT_IMPLEMENTED;
-}
-void _SsContDamper(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContExternal(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContNrpn1(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContNrpn2(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContRpn1(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContRpn2(short a0, short a1, unsigned char a2) { NOT_IMPLEMENTED; }
-void _SsContResetAll(short a0, short a1) { NOT_IMPLEMENTED; }
 
 void _SsSetNrpnVabAttr0(
     short a0, short a1, short a2, VagAtr a3, short a4, unsigned char a5) {
@@ -189,4 +155,40 @@ void _SsSetNrpnVabAttr18(
 void _SsSetNrpnVabAttr19(
     short a0, short a1, short a2, VagAtr a3, short a4, unsigned char a5) {
     NOT_IMPLEMENTED;
+}
+
+// Mixer buses (psyz/spu.h): which bus a voice joins when libsnd keys it on.
+// A SEP/SEQ voice carries seq_sep_no = (sep << 8) | seq_access_num; a voice
+// from SsUtKeyOn carries 0x21 and stays on bus 0, like any track the host
+// never routed.
+#define BUS_SEQ_MAX 32
+#define BUS_SEP_MAX 16
+static unsigned char seq_bus[BUS_SEQ_MAX][BUS_SEP_MAX];
+
+void Psyz_SndSetSeqBus(short seq_access_num, short sep_num, int bus) {
+    if (seq_access_num < 0 || seq_access_num >= BUS_SEQ_MAX || sep_num < 0 ||
+        sep_num >= BUS_SEP_MAX || bus < 0 || bus >= PSYZ_SPU_NUM_BUSES) {
+        return;
+    }
+    seq_bus[seq_access_num][sep_num] = (unsigned char)bus;
+}
+
+int psyz_snd_voice_bus(int voice) {
+    int seq_sep_no;
+    int seq;
+    int sep;
+
+    if (voice < 0 || voice >= NUM_VOICES) {
+        return 0;
+    }
+    seq_sep_no = (unsigned short)_svm_voice[voice].seq_sep_no;
+    if (seq_sep_no == 0x21) {
+        return 0;
+    }
+    seq = seq_sep_no & 0xFF;
+    sep = (seq_sep_no >> 8) & 0xFF;
+    if (seq >= BUS_SEQ_MAX || sep >= BUS_SEP_MAX) {
+        return 0;
+    }
+    return seq_bus[seq][sep];
 }

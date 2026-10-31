@@ -1,5 +1,6 @@
 #include <psyz.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../internal.h"
@@ -24,7 +25,11 @@ typedef struct {
 static u16 vram[VRAM_W * VRAM_H];
 static bool dither_enabled;
 
+static int def_dither_override = -1; // a queued primitive's own dither state
 static int SoftwareDither(void) {
+    if (def_dither_override >= 0) {
+        return def_dither_override;
+    }
     return dither_enabled && Psyz_VideoGetDitheringMode() != PSYZ_DITHER_OFF;
 }
 static Point draw_offset;
@@ -39,6 +44,70 @@ static bool set_mask_bit;
 static bool preserve_masked;
 static unsigned grid_source = 1;
 static unsigned grid_target = 1;
+
+// Side gutters (Psyz_VideoSetGutter): columns past the left and right edges
+// of a display-sized drawing area, kept outside VRAM. Row y of a plane is the
+// gutter of VRAM row y; column 0 is the leftmost gutter pixel.
+static u16 gutter_planes[2][VRAM_H * PSYZ_GUTTER_MAX];
+static int gutter_px;
+static int gutter_x0;
+static int gutter_w;
+static bool gutter_active; // the current drawing area takes the gutters
+
+// An area spanning the display's columns takes the gutters, whatever its
+// height: a layer clipped to a band of rows (a banner closing from the top
+// and the bottom) still reaches the side gutters in those rows.
+static void UpdateGutterActive(void) {
+    gutter_active = gutter_px > 0 && draw_area_start.x == gutter_x0 &&
+                    draw_area_end.x == gutter_x0 + gutter_w - 1;
+}
+
+// leftmost and rightmost column a primitive may touch
+static int ClipX0(void) {
+    return gutter_active ? draw_area_start.x - gutter_px
+                         : (draw_area_start.x > 0 ? draw_area_start.x : 0);
+}
+
+static int ClipX1(void) {
+    return gutter_active
+               ? draw_area_end.x + gutter_px
+               : (draw_area_end.x < VRAM_W - 1 ? draw_area_end.x : VRAM_W - 1);
+}
+
+// the pixel (x, y) is written to, or NULL when it is clipped
+static u16* PixelPtr(int x, int y) {
+    if (y < draw_area_start.y || y > draw_area_end.y || y < 0 || y >= VRAM_H) {
+        return NULL;
+    }
+    if (x >= draw_area_start.x && x <= draw_area_end.x) {
+        return x >= 0 && x < VRAM_W ? &vram[y * VRAM_W + x] : NULL;
+    }
+    if (!gutter_active) {
+        return NULL;
+    }
+    if (x < draw_area_start.x && x >= draw_area_start.x - gutter_px) {
+        return &gutter_planes[0][y * PSYZ_GUTTER_MAX +
+                                 (x - (draw_area_start.x - gutter_px))];
+    }
+    if (x > draw_area_end.x && x <= draw_area_end.x + gutter_px) {
+        return &gutter_planes[1][y * PSYZ_GUTTER_MAX +
+                                 (x - draw_area_end.x - 1)];
+    }
+    return NULL;
+}
+
+static void FillGutterRows(int y0, int y1, u16 color) {
+    y0 = CLAMP(y0, 0, VRAM_H);
+    y1 = CLAMP(y1, 0, VRAM_H);
+    for (int side = 0; side < 2; side++) {
+        for (int y = y0; y < y1; y++) {
+            u16* row = &gutter_planes[side][y * PSYZ_GUTTER_MAX];
+            for (int x = 0; x < PSYZ_GUTTER_MAX; x++) {
+                row[x] = color;
+            }
+        }
+    }
+}
 
 static int Sign11(int value) {
     value &= 0x7ff;
@@ -62,12 +131,8 @@ static u16 PackColor(int r, int g, int b, bool mask) {
                  (mask ? 0x8000 : 0));
 }
 
-static void WritePixel(int x, int y, u16 src, bool semi, int abr) {
-    if (x < draw_area_start.x || x > draw_area_end.x || y < draw_area_start.y ||
-        y > draw_area_end.y || x < 0 || x >= VRAM_W || y < 0 || y >= VRAM_H) {
-        return;
-    }
-    u16* out = &vram[y * VRAM_W + x];
+// writes src to the pixel at out: mask test, semi-transparency, mask bit
+static inline void PlotPixel(u16* out, u16 src, bool semi, int abr) {
     if (preserve_masked && (*out & 0x8000)) {
         return;
     }
@@ -107,27 +172,80 @@ static void WritePixel(int x, int y, u16 src, bool semi, int abr) {
         (u16)((src & 0x7fff) | ((src | (set_mask_bit ? 0x8000 : 0)) & 0x8000));
 }
 
-static u16 SampleTexture(int u, int v, u16 tpage, u16 clut) {
+static void WritePixel(int x, int y, u16 src, bool semi, int abr) {
+    u16* out = PixelPtr(x, y);
+    if (out) {
+        PlotPixel(out, src, semi, abr);
+    }
+}
+
+// The columns of row y that PixelPtr accepts (within ClipX0..ClipX1), as up
+// to three runs in increasing x: left gutter, VRAM, right gutter. Column x of
+// a run is run->row[x - run->x0]. The caller has checked y the way PixelPtr
+// does.
+typedef struct {
+    int x0, x1;
+    u16* row;
+} RowRun;
+
+static int RowRuns(int y, RowRun* runs) {
+    int n = 0;
+    int vx0 = draw_area_start.x > 0 ? draw_area_start.x : 0;
+    int vx1 = draw_area_end.x < VRAM_W - 1 ? draw_area_end.x : VRAM_W - 1;
+    if (gutter_active) {
+        int gx0 = draw_area_start.x - gutter_px;
+        if (gx0 <= draw_area_start.x - 1) {
+            runs[n++] = (RowRun){
+                gx0, draw_area_start.x - 1,
+                &gutter_planes[0][y * PSYZ_GUTTER_MAX]};
+        }
+    }
+    if (vx0 <= vx1) {
+        runs[n++] = (RowRun){vx0, vx1, &vram[y * VRAM_W + vx0]};
+    }
+    if (gutter_active) {
+        int gx1 = draw_area_end.x + gutter_px;
+        if (draw_area_end.x + 1 <= gx1) {
+            runs[n++] = (RowRun){
+                draw_area_end.x + 1, gx1,
+                &gutter_planes[1][y * PSYZ_GUTTER_MAX]};
+        }
+    }
+    return n;
+}
+
+// A texture page and CLUT decoded once per primitive; FetchTexel is the
+// texel at (u, v) through the texture window.
+typedef struct {
+    int tx, ty0, depth, clut_x;
+    const u16* clut_row;
+} TexPage;
+
+static inline TexPage TexPageOf(u16 tpage, u16 clut) {
+    TexPage t;
+    t.tx = (tpage & 0xf) * 64;
+    t.ty0 = ((tpage >> 4) & 1) * 256;
+    t.depth = (tpage >> 7) & 3;
+    t.clut_x = (clut & 0x3f) * 16;
+    t.clut_row = &vram[((clut >> 6) & 511) * VRAM_W];
+    return t;
+}
+
+static inline u16 FetchTexel(const TexPage* t, int u, int v) {
     u = ((u & twin_and_x) | twin_or_x) & 0xff;
     v = ((v & twin_and_y) | twin_or_y) & 0xff;
-    int tx = (tpage & 0xf) * 64;
-    int ty = ((tpage >> 4) & 1) * 256 + v;
-    int depth = (tpage >> 7) & 3;
-    if (depth == 0) {
-        u16 packed = vram[ty * VRAM_W + ((tx + u / 4) & 1023)];
+    const u16* row = &vram[(t->ty0 + v) * VRAM_W];
+    if (t->depth == 0) {
+        u16 packed = row[(t->tx + u / 4) & 1023];
         int index = (packed >> ((u & 3) * 4)) & 15;
-        int cx = ((clut & 0x3f) * 16 + index) & 1023;
-        int cy = (clut >> 6) & 511;
-        return vram[cy * VRAM_W + cx];
+        return t->clut_row[(t->clut_x + index) & 1023];
     }
-    if (depth == 1) {
-        u16 packed = vram[ty * VRAM_W + ((tx + u / 2) & 1023)];
+    if (t->depth == 1) {
+        u16 packed = row[(t->tx + u / 2) & 1023];
         int index = (packed >> ((u & 1) * 8)) & 255;
-        int cx = ((clut & 0x3f) * 16 + index) & 1023;
-        int cy = (clut >> 6) & 511;
-        return vram[cy * VRAM_W + cx];
+        return t->clut_row[(t->clut_x + index) & 1023];
     }
-    return vram[ty * VRAM_W + ((tx + u) & 1023)];
+    return row[(t->tx + u) & 1023];
 }
 
 static const int dither[4][4] = {
@@ -154,6 +272,21 @@ static u16 ShadeTexel(
     return PackColor(tr, tg, tb, (texel & 0x8000) != 0);
 }
 
+// ShadeTexel(texel, 128, 128, 128, false, x, y, true) without the arithmetic:
+// the modulation is tr * 8 (at most 248), so adding the dither d in -4..3 and
+// shifting by 3 gives tr, or tr - 1 (at least 0) where d < 0, per channel.
+// 1 bits mark the dither cells with d < 0, indexed by (y & 3) * 4 + (x & 3).
+#define DITHER_NEG_CELLS 0xa5a5 // rows {-4,0,-3,1} {2,-2,3,-1} {-3,1,-4,0} {3,-1,2,-2}
+static inline u16 DitherNeutralTexel(u16 texel, int x, int y) {
+    u16 m = texel & 0x7fff;
+    if ((DITHER_NEG_CELLS >> (((y & 3) << 2) | (x & 3))) & 1) {
+        // bit 0 of each channel: set when the channel is not zero
+        u16 nz = (u16)((m | (m >> 1) | (m >> 2) | (m >> 3) | (m >> 4)) & 0x0421);
+        m = (u16)(m - nz);
+    }
+    return (u16)(m | (texel & 0x8000));
+}
+
 static int64_t Edge(const SwVertex* a, const SwVertex* b, int px2, int py2) {
     return (int64_t)(px2 - a->x * 2) * (b->y - a->y) -
            (int64_t)(py2 - a->y * 2) * (b->x - a->x);
@@ -163,6 +296,136 @@ static bool IsTopLeft(const SwVertex* a, const SwVertex* b) {
     int dy = b->y - a->y;
     int dx = b->x - a->x;
     return dy < 0 || (dy == 0 && dx > 0);
+}
+
+// An attribute interpolated along a row of a triangle: q is
+// (wa * a + wb * b + wc * c) / denom, with the remainder r kept in [0, denom)
+// so that one step to the next column is an add, not a division. Valid while
+// the numerator is >= 0, which it is inside the triangle (the weights and the
+// attributes are >= 0), so q equals the truncating division it replaces.
+typedef struct {
+    int64_t q, r, dq, dr;
+    // the step to the same column of the next row, and the value at the first
+    // covered column of the previous row (see RowLerpNext)
+    int64_t dqy, dry, sq, sr;
+} RowLerp;
+
+// the step to the next column, once per triangle
+static inline void RowLerpInit(RowLerp* l, int64_t dn, int denom) {
+    l->dq = dn / denom;
+    l->dr = dn % denom;
+}
+
+// the step to the next row, once per triangle
+static inline void RowLerpInitRow(RowLerp* l, int64_t dn, int denom) {
+    l->dqy = dn / denom;
+    l->dry = dn % denom;
+}
+
+// the value at the first covered column of a row
+static inline void RowLerpStart(RowLerp* l, int64_t n, int denom) {
+    l->q = n / denom;
+    l->r = n % denom;
+    l->sq = l->q;
+    l->sr = l->r;
+}
+
+// The value at the first covered column of the next row, from the one of the
+// previous row: dk columns over and one row down, with the remainder brought
+// back into [0, denom) by adds (dk is small). It is the same quotient and
+// remainder RowLerpStart gives, without its divisions.
+static inline void RowLerpNext(RowLerp* l, int dk, int denom) {
+    int64_t q = l->sq + l->dqy + l->dq * dk;
+    int64_t r = l->sr + l->dry + l->dr * dk;
+
+    while (r >= denom) {
+        r -= denom;
+        q++;
+    }
+    while (r < 0) {
+        r += denom;
+        q--;
+    }
+    l->q = q;
+    l->r = r;
+    l->sq = q;
+    l->sr = r;
+}
+
+static inline void RowLerpStep(RowLerp* l, int denom) {
+    l->q += l->dq;
+    l->r += l->dr;
+    if (l->r >= denom) {
+        l->r -= denom;
+        l->q++;
+    } else if (l->r < 0) {
+        l->r += denom;
+        l->q--;
+    }
+}
+
+// One edge function e0 + s * k (k = column offset from min_x; e0 is the value
+// at min_x of the current row) passes where s * k <= lim - e0, lim being 0 on
+// a top or left edge and -1 otherwise (below zero, or zero on a top or left
+// edge). With d = |s| and q = floor((lim - e0) / d) that is k <= q for s > 0
+// and k >= -q for s < 0, and for s == 0 all k or none. q follows the rows
+// without a division: e0 moves by a constant per row, so q and the remainder
+// rem = (lim - e0) - q * d move by a constant quotient and remainder.
+typedef struct {
+    int64_t d, lim, q, rem, dq, drem;
+    int kind; // 0: s == 0, 1: s > 0 (upper bound), 2: s < 0 (lower bound)
+} SpanEdge;
+
+static inline int64_t FloorDiv(int64_t n, int64_t d) { // d > 0
+    int64_t q = n / d;
+    return (n % d < 0) ? q - 1 : q;
+}
+
+// row_step: how much e0 changes from one row to the next
+static void SpanEdgeInit(SpanEdge* e, int64_t s, bool tl, int64_t row_step) {
+    e->lim = tl ? 0 : -1;
+    e->kind = s == 0 ? 0 : (s > 0 ? 1 : 2);
+    e->d = s < 0 ? -s : s;
+    if (e->kind) {
+        e->dq = FloorDiv(-row_step, e->d);
+        e->drem = -row_step - e->dq * e->d;
+    }
+}
+
+static inline void SpanEdgeStart(SpanEdge* e, int64_t e0) {
+    if (e->kind) {
+        int64_t r = e->lim - e0;
+
+        e->q = FloorDiv(r, e->d);
+        e->rem = r - e->q * e->d;
+    }
+}
+
+static inline void SpanEdgeNext(SpanEdge* e) {
+    if (e->kind) {
+        e->q += e->dq;
+        e->rem += e->drem;
+        if (e->rem >= e->d) {
+            e->rem -= e->d;
+            e->q++;
+        }
+    }
+}
+
+// Narrows [*klo, *khi] by the edge at e0.
+static inline void SpanEdgeApply(const SpanEdge* e, int64_t e0, int64_t* klo,
+                                 int64_t* khi) {
+    if (e->kind == 1) {
+        if (e->q < *khi) {
+            *khi = e->q;
+        }
+    } else if (e->kind == 2) {
+        if (-e->q > *klo) {
+            *klo = -e->q;
+        }
+    } else if (e->lim - e0 < 0) {
+        *khi = *klo - 1;
+    }
 }
 
 static void RasterTriangle(
@@ -179,56 +442,199 @@ static void RasterTriangle(
         c = swap;
         area = -area;
     }
-    int min_x = CLAMP(Min3(a.x, b.x, c.x), draw_area_start.x, draw_area_end.x);
-    int max_x = CLAMP(Max3(a.x, b.x, c.x), draw_area_start.x, draw_area_end.x);
+    int min_x = CLAMP(Min3(a.x, b.x, c.x), ClipX0(), ClipX1());
+    int max_x = CLAMP(Max3(a.x, b.x, c.x), ClipX0(), ClipX1());
     int min_y = CLAMP(Min3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
     int max_y = CLAMP(Max3(a.y, b.y, c.y), draw_area_start.y, draw_area_end.y);
-    min_x = CLAMP(min_x, 0, VRAM_W - 1);
-    max_x = CLAMP(max_x, 0, VRAM_W - 1);
     min_y = CLAMP(min_y, 0, VRAM_H - 1);
     max_y = CLAMP(max_y, 0, VRAM_H - 1);
+    // Only rows that pass PixelPtr's y test can be written: the clamps above
+    // still leave row 511 when the area starts at y >= 512 (or row 0 when it
+    // ends above 0), and an inverted area keeps rows. Those rows write nothing
+    // through PixelPtr, so dropping them here keeps the pixels the same.
+    if (min_y < draw_area_start.y) {
+        min_y = draw_area_start.y;
+    }
+    if (max_y > draw_area_end.y) {
+        max_y = draw_area_end.y;
+    }
     int abr = (tpage >> 5) & 3;
+    // Per row, the edge functions step by a constant per column, and the
+    // covered columns are one run (each edge test passes on a half-line of
+    // x), so the row ends at the first miss after a hit. Exact integer steps:
+    // the same pixels and values as evaluating Edge at every column.
+    bool dith = SoftwareDither() != 0;
+    TexPage tex = TexPageOf(tpage, clut);
+    // ShadeTexel returns the texel as it is: raw, or flat neutral undithered
+    bool keep_texel = raw_texture || (!gouraud && !dith && a.r == 128 &&
+                                      a.g == 128 && a.b == 128);
+    // the common textured case with dither on: a neutral color (128)
+    bool neutral_dither = textured && dith && !raw_texture && !gouraud &&
+                          a.r == 128 && a.g == 128 && a.b == 128;
+    bool top_left_a = IsTopLeft(&b, &c);
+    bool top_left_b = IsTopLeft(&c, &a);
+    bool top_left_c = IsTopLeft(&a, &b);
+    int64_t step_a = 2 * (int64_t)(c.y - b.y);
+    int64_t step_b = 2 * (int64_t)(a.y - c.y);
+    int64_t step_c = 2 * (int64_t)(b.y - a.y);
+    int denom = (int)(area * 2);
+    // a denominator that the int conversion wrapped keeps the division
+    bool lerp = denom > 0;
+    RowLerp lr = {0}, lg = {0}, lb = {0}, lu = {0}, lv = {0};
+    // the weights step by minus the edge steps
+#define DW(p) (-step_a * a.p - step_b * b.p - step_c * c.p)
+    if (lerp && gouraud) {
+        RowLerpInit(&lr, DW(r), denom);
+        RowLerpInit(&lg, DW(g), denom);
+        RowLerpInit(&lb, DW(b), denom);
+    }
+    if (lerp && textured) {
+        RowLerpInit(&lu, DW(u), denom);
+        RowLerpInit(&lv, DW(v), denom);
+    }
+#undef DW
+    // the edge functions and the weights also step by a constant per row
+    int64_t row_a = 2 * (int64_t)(b.x - c.x);
+    int64_t row_b = 2 * (int64_t)(c.x - a.x);
+    int64_t row_c = 2 * (int64_t)(a.x - b.x);
+#define DWY(p) (-row_a * a.p - row_b * b.p - row_c * c.p)
+    if (lerp && gouraud) {
+        RowLerpInitRow(&lr, DWY(r), denom);
+        RowLerpInitRow(&lg, DWY(g), denom);
+        RowLerpInitRow(&lb, DWY(b), denom);
+    }
+    if (lerp && textured) {
+        RowLerpInitRow(&lu, DWY(u), denom);
+        RowLerpInitRow(&lv, DWY(v), denom);
+    }
+#undef DWY
+    SpanEdge span_a, span_b, span_c;
+    SpanEdgeInit(&span_a, step_a, top_left_a, row_a);
+    SpanEdgeInit(&span_b, step_b, top_left_b, row_b);
+    SpanEdgeInit(&span_c, step_c, top_left_c, row_c);
+    int prev_start_y = -2; // the row whose first covered column lr..lv hold
+    int prev_start_x = 0;
     for (int y = min_y; y <= max_y; y++) {
-        for (int x = min_x; x <= max_x; x++) {
-            int64_t wa = Edge(&b, &c, x * 2 + centered, y * 2 + centered);
-            int64_t wb = Edge(&c, &a, x * 2 + centered, y * 2 + centered);
-            int64_t wc = Edge(&a, &b, x * 2 + centered, y * 2 + centered);
-            if (wa > 0 || (wa == 0 && !IsTopLeft(&b, &c)) || wb > 0 ||
-                (wb == 0 && !IsTopLeft(&c, &a)) || wc > 0 ||
-                (wc == 0 && !IsTopLeft(&a, &b))) {
-                continue;
+        int px2 = min_x * 2 + centered;
+        int py2 = y * 2 + centered;
+        int64_t ea = Edge(&b, &c, px2, py2);
+        int64_t eb = Edge(&c, &a, px2, py2);
+        int64_t ec = Edge(&a, &b, px2, py2);
+        if (y == min_y) {
+            SpanEdgeStart(&span_a, ea);
+            SpanEdgeStart(&span_b, eb);
+            SpanEdgeStart(&span_c, ec);
+        } else {
+            SpanEdgeNext(&span_a);
+            SpanEdgeNext(&span_b);
+            SpanEdgeNext(&span_c);
+        }
+        bool hit = false;
+        // rows here pass PixelPtr's y test (min_y..max_y lie in the area and
+        // in VRAM, see above), and RowRuns are PixelPtr's columns
+        RowRun runs[3];
+        int nruns = RowRuns(y, runs);
+        int run = 0;
+        // The covered columns of this row are the k in [klo, khi] (x = min_x
+        // + k) where all three edge functions pass: each is linear in k, so
+        // each bounds k from one side. The same columns the per-column test
+        // finds (it hits a contiguous run), without visiting the misses.
+        int64_t klo = 0;
+        int64_t khi = (int64_t)max_x - min_x;
+        SpanEdgeApply(&span_a, ea, &klo, &khi);
+        SpanEdgeApply(&span_b, eb, &klo, &khi);
+        SpanEdgeApply(&span_c, ec, &klo, &khi);
+        if (klo > khi) {
+            continue;
+        }
+        ea += step_a * klo;
+        eb += step_b * klo;
+        ec += step_c * klo;
+        for (int x = min_x + (int)klo; x <= min_x + (int)khi;
+             x++, ea += step_a, eb += step_b, ec += step_c) {
+            int64_t wa = -ea;
+            int64_t wb = -eb;
+            int64_t wc = -ec;
+#define WN(p) (wa * a.p + wb * b.p + wc * c.p)
+            if (lerp && !hit) {
+                // from the previous row's start when it is the row above and
+                // the start moved only a few columns, else by division
+                int dk = x - prev_start_x;
+                bool next = prev_start_y == y - 1 && dk >= -3 && dk <= 3;
+
+                if (gouraud) {
+                    if (next) {
+                        RowLerpNext(&lr, dk, denom);
+                        RowLerpNext(&lg, dk, denom);
+                        RowLerpNext(&lb, dk, denom);
+                    } else {
+                        RowLerpStart(&lr, WN(r), denom);
+                        RowLerpStart(&lg, WN(g), denom);
+                        RowLerpStart(&lb, WN(b), denom);
+                    }
+                }
+                if (textured) {
+                    if (next) {
+                        RowLerpNext(&lu, dk, denom);
+                        RowLerpNext(&lv, dk, denom);
+                    } else {
+                        RowLerpStart(&lu, WN(u), denom);
+                        RowLerpStart(&lv, WN(v), denom);
+                    }
+                }
+                prev_start_y = y;
+                prev_start_x = x;
+            } else if (lerp) {
+                if (gouraud) {
+                    RowLerpStep(&lr, denom);
+                    RowLerpStep(&lg, denom);
+                    RowLerpStep(&lb, denom);
+                }
+                if (textured) {
+                    RowLerpStep(&lu, denom);
+                    RowLerpStep(&lv, denom);
+                }
             }
-            wa = -wa;
-            wb = -wb;
-            wc = -wc;
-            int denom = (int)(area * 2);
-            int r =
-                gouraud ? (int)((wa * a.r + wb * b.r + wc * c.r) / denom) : a.r;
-            int g =
-                gouraud ? (int)((wa * a.g + wb * b.g + wc * c.g) / denom) : a.g;
-            int blue =
-                gouraud ? (int)((wa * a.b + wb * b.b + wc * c.b) / denom) : a.b;
+            hit = true;
+            int r = !gouraud ? a.r
+                    : lerp   ? (int)lr.q
+                             : (int)(WN(r) / denom);
+            int g = !gouraud ? a.g
+                    : lerp   ? (int)lg.q
+                             : (int)(WN(g) / denom);
+            int blue = !gouraud ? a.b
+                       : lerp   ? (int)lb.q
+                                : (int)(WN(b) / denom);
             u16 color;
             bool blend = semi;
             if (textured) {
-                int64_t ta = -Edge(&b, &c, x * 2 + centered, y * 2 + centered);
-                int64_t tb = -Edge(&c, &a, x * 2 + centered, y * 2 + centered);
-                int64_t tc = -Edge(&a, &b, x * 2 + centered, y * 2 + centered);
-                int u = (int)((ta * a.u + tb * b.u + tc * c.u) / denom);
-                int v = (int)((ta * a.v + tb * b.v + tc * c.v) / denom);
-                u16 texel = SampleTexture(u, v, tpage, clut);
+                int u = lerp ? (int)lu.q : (int)(WN(u) / denom);
+                int v = lerp ? (int)lv.q : (int)(WN(v) / denom);
+#undef WN
+                u16 texel = FetchTexel(&tex, u, v);
                 if (texel == 0) {
                     continue;
                 }
                 blend = semi && (texel & 0x8000);
-                color = ShadeTexel(texel, r, g, blue, raw_texture, x, y,
-                                   SoftwareDither() != 0 && !raw_texture);
+                if (keep_texel) {
+                    color = texel;
+                } else if (neutral_dither) {
+                    color = DitherNeutralTexel(texel, x, y);
+                } else {
+                    color = ShadeTexel(texel, r, g, blue, raw_texture, x, y,
+                                       dith && !raw_texture);
+                }
             } else {
-                int d = SoftwareDither() && gouraud ? dither[y & 3][x & 3] : 0;
+                int d = dith && gouraud ? dither[y & 3][x & 3] : 0;
                 color = PackColor(
                     (r + d) >> 3, (g + d) >> 3, (blue + d) >> 3, false);
             }
-            WritePixel(x, y, color, blend, abr);
+            while (run < nruns && x > runs[run].x1) {
+                run++;
+            }
+            if (run < nruns && x >= runs[run].x0) {
+                PlotPixel(&runs[run].row[x - runs[run].x0], color, blend, abr);
+            }
         }
     }
 }
@@ -281,39 +687,134 @@ static void DrawLine(SwVertex a, SwVertex b, bool semi, u16 tpage) {
     RasterTriangle(q0, q2, q3, false, false, semi, true, tpage, 0, true);
 }
 
+// Rectangles (GP0 0x60-0x7f). The same pixels in the same order (rows top to
+// bottom, columns left to right) as testing each pixel of the rectangle
+// against ClipX0/ClipX1 and PixelPtr, but clipped once per row (RowRuns), with
+// the texture row, the CLUT row and ShadeTexel's modulation (a table per
+// channel) looked up once, and an opaque untextured rectangle as a plain fill.
 static void RasterSprite(
     const SwVertex* origin, int w, int source_w, int h, int u, int v,
     bool textured, bool raw_texture, bool semi, u16 clut) {
     int abr = (cur_tpage >> 5) & 3;
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    int ox = origin->x;
+    int ox1 = ox + w - 1;
+    bool scaled = source_w != w;
+    u16 flat =
+        PackColor(origin->r >> 3, origin->g >> 3, origin->b >> 3, false);
+    u16 flat_out = (u16)((flat & 0x7fff) |
+                         ((flat | (set_mask_bit ? 0x8000 : 0)) & 0x8000));
+    bool flat_fill = !textured && !semi && !preserve_masked;
+    u16 mod_r[32], mod_g[32], mod_b[32];
+    int tx = (cur_tpage & 0xf) * 64;
+    int ty0 = ((cur_tpage >> 4) & 1) * 256;
+    int depth = (cur_tpage >> 7) & 3;
+    const u16* clut_row = &vram[((clut >> 6) & 511) * VRAM_W];
+    int clut_x = (clut & 0x3f) * 16;
+    // ShadeTexel leaves a texel as it is at the neutral color (128, 128, 128)
+    bool keep_texel = raw_texture || (origin->r == 128 && origin->g == 128 &&
+                                      origin->b == 128);
+    // the common case: no texture window, no scaling, opaque, no mask test,
+    // texel kept; PlotPixel then only sets the mask bit
+    bool plain = keep_texel && !scaled && !semi && !preserve_masked &&
+                 twin_and_x == 0xff && twin_or_x == 0;
+    u16 set_bit = set_mask_bit ? 0x8000 : 0;
+    if (textured && !raw_texture) {
+        for (int c = 0; c < 32; c++) {
+            mod_r[c] = (u16)CLAMP((c * origin->r) >> 7, 0, 31);
+            mod_g[c] = (u16)(CLAMP((c * origin->g) >> 7, 0, 31) << 5);
+            mod_b[c] = (u16)(CLAMP((c * origin->b) >> 7, 0, 31) << 10);
+        }
+    }
     for (int py = 0; py < h; py++) {
         int y = origin->y + py;
         if (y < draw_area_start.y || y > draw_area_end.y || y < 0 ||
             y >= VRAM_H) {
             continue;
         }
-        for (int px = 0; px < w; px++) {
-            int x = origin->x + px;
-            if (x < draw_area_start.x || x > draw_area_end.x || x < 0 ||
-                x >= VRAM_W) {
+        RowRun runs[3];
+        int nruns = RowRuns(y, runs);
+        const u16* trow = NULL;
+        if (textured) {
+            int tv = (((v + py) & twin_and_y) | twin_or_y) & 0xff;
+            trow = &vram[(ty0 + tv) * VRAM_W];
+        }
+        for (int r = 0; r < nruns; r++) {
+            int xa = runs[r].x0 > ox ? runs[r].x0 : ox;
+            int xb = runs[r].x1 < ox1 ? runs[r].x1 : ox1;
+            if (xa > xb) {
                 continue;
             }
-            u16 color;
-            bool blend = semi;
-            if (textured) {
-                int sample_x = w ? px * source_w / w : 0;
-                u16 texel =
-                    SampleTexture(u + sample_x, v + py, cur_tpage, clut);
+            u16* out = runs[r].row + (xa - runs[r].x0);
+            if (!textured) {
+                if (flat_fill) {
+                    for (int x = xa; x <= xb; x++) {
+                        *out++ = flat_out;
+                    }
+                } else {
+                    for (int x = xa; x <= xb; x++) {
+                        PlotPixel(out++, flat, semi, abr);
+                    }
+                }
+                continue;
+            }
+            if (plain) {
+                int su = (u + (xa - ox)) & 0xff;
+                if (depth == 0) {
+                    for (int x = xa; x <= xb; x++, out++, su = (su + 1) & 0xff) {
+                        u16 packed = trow[(tx + su / 4) & 1023];
+                        int index = (packed >> ((su & 3) * 4)) & 15;
+                        u16 texel = clut_row[(clut_x + index) & 1023];
+                        // transparent texels keep the pixel (no branch)
+                        *out = texel ? (u16)(texel | set_bit) : *out;
+                    }
+                } else if (depth == 1) {
+                    for (int x = xa; x <= xb; x++, out++, su = (su + 1) & 0xff) {
+                        u16 packed = trow[(tx + su / 2) & 1023];
+                        int index = (packed >> ((su & 1) * 8)) & 255;
+                        u16 texel = clut_row[(clut_x + index) & 1023];
+                        // transparent texels keep the pixel (no branch)
+                        *out = texel ? (u16)(texel | set_bit) : *out;
+                    }
+                } else {
+                    for (int x = xa; x <= xb; x++, out++, su = (su + 1) & 0xff) {
+                        u16 texel = trow[(tx + su) & 1023];
+                        // transparent texels keep the pixel (no branch)
+                        *out = texel ? (u16)(texel | set_bit) : *out;
+                    }
+                }
+                continue;
+            }
+            for (int x = xa; x <= xb; x++, out++) {
+                int px = x - ox;
+                int su = (((u + (scaled ? px * source_w / w : px)) &
+                           twin_and_x) |
+                          twin_or_x) &
+                         0xff;
+                u16 texel;
+                if (depth == 0) {
+                    u16 packed = trow[(tx + su / 4) & 1023];
+                    int index = (packed >> ((su & 3) * 4)) & 15;
+                    texel = clut_row[(clut_x + index) & 1023];
+                } else if (depth == 1) {
+                    u16 packed = trow[(tx + su / 2) & 1023];
+                    int index = (packed >> ((su & 1) * 8)) & 255;
+                    texel = clut_row[(clut_x + index) & 1023];
+                } else {
+                    texel = trow[(tx + su) & 1023];
+                }
                 if (texel == 0) {
                     continue;
                 }
-                blend = semi && (texel & 0x8000);
-                color = ShadeTexel(texel, origin->r, origin->g, origin->b,
-                                   raw_texture, x, y, false);
-            } else {
-                color = PackColor(
-                    origin->r >> 3, origin->g >> 3, origin->b >> 3, false);
+                bool blend = semi && (texel & 0x8000);
+                if (!keep_texel) {
+                    texel = (u16)(mod_r[texel & 31] | mod_g[(texel >> 5) & 31] |
+                                  mod_b[(texel >> 10) & 31] | (texel & 0x8000));
+                }
+                PlotPixel(out, texel, blend, abr);
             }
-            WritePixel(x, y, color, blend, abr);
         }
     }
 }
@@ -324,6 +825,7 @@ static void Software_Reset(void) {
     draw_area_start = (Point){0, 0};
     draw_area_end = (Point){VRAM_W - 1, VRAM_H - 1};
     set_mask_bit = preserve_masked = false;
+    UpdateGutterActive();
 }
 
 static void Software_SetTexpageMode(ParamDrawTexpageMode* p) {
@@ -344,9 +846,13 @@ static void Software_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
 
 static void Software_SetAreaStart(int x, int y) {
     draw_area_start = (Point){x, y};
+    UpdateGutterActive();
 }
 
-static void Software_SetAreaEnd(int x, int y) { draw_area_end = (Point){x, y}; }
+static void Software_SetAreaEnd(int x, int y) {
+    draw_area_end = (Point){x, y};
+    UpdateGutterActive();
+}
 
 static void Software_SetOffset(int x, int y) {
     draw_offset = (Point){Sign11(x), Sign11(y)};
@@ -367,7 +873,7 @@ static void Software_SetMask(int bit0, int bit1) {
     preserve_masked = bit1 != 0;
 }
 
-static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
+static void Software_ClearImageNow(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     u16 color = PackColor(r >> 3, g >> 3, b >> 3, set_mask_bit);
     int x0 = CLAMP(rect->x, 0, VRAM_W);
     int y0 = CLAMP(rect->y, 0, VRAM_H);
@@ -381,9 +887,13 @@ static void Software_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
             }
         }
     }
+    // a clear of the whole gutter-sized display also clears its gutters
+    if (gutter_px > 0 && rect->x == gutter_x0 && rect->w == gutter_w) {
+        FillGutterRows(rect->y, rect->y + rect->h, color);
+    }
 }
 
-static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
+static void Software_LoadImageNow(PS1_RECT* rect, u_long* data) {
     if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
@@ -407,7 +917,7 @@ static void Software_LoadImage(PS1_RECT* rect, u_long* data) {
     }
 }
 
-static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
+static void Software_StoreImageNow(PS1_RECT* rect, u_long* data) {
     if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
@@ -432,7 +942,7 @@ static void Software_StoreImage(PS1_RECT* rect, u_long* data) {
     }
 }
 
-static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
+static void Software_MoveImageNow(PS1_RECT* rect, unsigned int x, unsigned int y) {
     int src_x = CLAMP(rect->x, 0, VRAM_W - 1);
     int src_y = CLAMP(rect->y, 0, VRAM_H - 1);
     int dst_x = CLAMP((int)x, 0, VRAM_W - 1);
@@ -452,7 +962,7 @@ static void Software_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     }
 }
 
-static int Software_PushPrim(u_long* words, int max_len) {
+static int Software_PushPrimNow(u_long* words, int max_len) {
     if (max_len <= 0) {
         return 0;
     }
@@ -558,6 +1068,12 @@ static int Software_PushPrim(u_long* words, int max_len) {
             w = h = 16;
             break;
         }
+        // a background clear covering the drawing area covers the gutters too
+        if (gutter_active && !textured && origin.x == draw_area_start.x &&
+            w == draw_area_end.x - draw_area_start.x + 1) {
+            origin.x -= gutter_px;
+            w += gutter_px * 2;
+        }
         int source_w = w;
         if (grid_source != grid_target) {
             w = w * (int)grid_target / (int)grid_source;
@@ -570,16 +1086,86 @@ static int Software_PushPrim(u_long* words, int max_len) {
     return 1;
 }
 
+#include "sdl3_software_defer.inc"
+
 void SoftwareRasterizer_Reset(void) {
+    DefDiscardAll();
     memset(vram, 0, sizeof(vram));
     Software_Reset();
+    memset(gutter_planes, 0, sizeof(gutter_planes));
+    gutter_px = gutter_x0 = gutter_w = 0;
+    gutter_active = false;
     grid_source = grid_target = 1;
     twin_and_x = twin_and_y = 0xff;
     twin_or_x = twin_or_y = 0;
     dither_enabled = false;
 }
 
-const u16* SoftwareRasterizer_GetVram(void) { return vram; }
+const u16* SoftwareRasterizer_GetVram(void) {
+    DefSyncAll();
+    return vram;
+}
+
+const u16* SoftwareRasterizer_GetVramRaw(void) { return vram; }
+
+void SoftwareRasterizer_SetGutter(int px, int x0, int w, int h) {
+    px = CLAMP(px, 0, PSYZ_GUTTER_MAX);
+    if (px == gutter_px && x0 == gutter_x0 && w == gutter_w) {
+        (void)h;
+        return; // the flip repeats it every frame; nothing changes
+    }
+    DefSyncAll(); // queued primitives belong to the old gutters
+    if (px != gutter_px) {
+        FillGutterRows(0, VRAM_H, 0);
+    }
+    gutter_px = px;
+    gutter_x0 = x0;
+    gutter_w = w;
+    (void)h; // the display height; any band of rows takes the gutters
+    UpdateGutterActive();
+}
+
+int SoftwareRasterizer_GetGutter(void) { return gutter_px; }
+
+const u16* SoftwareRasterizer_GetGutterPlane(int side) {
+    DefSyncAll();
+    return gutter_planes[side ? 1 : 0];
+}
+
+const u16* SoftwareRasterizer_GetGutterPlaneRaw(int side) {
+    return gutter_planes[side ? 1 : 0];
+}
+
+void SoftwareRasterizer_ClearGutterRows(int y0, int y1) {
+    if (def_n) {
+        DefOpDesc o = {.nr = 0, .w = IR_EMPTY, .gw0 = CLAMP(y0, 0, VRAM_H),
+                       .gw1 = CLAMP(y1, 0, VRAM_H) - 1};
+        DefOp(&o);
+    }
+    FillGutterRows(y0, y1, 0);
+}
+
+int SoftwareRasterizer_CopyGutters(int src_y, int h, int dx, int dy) {
+    if (gutter_px <= 0) {
+        return 0;
+    }
+    if (h <= 0 || src_y < 0 || dy < 0 || src_y + h > VRAM_H ||
+        dy + h > VRAM_H || dx - gutter_px < 0 ||
+        dx + gutter_w + gutter_px > VRAM_W) {
+        return -1;
+    }
+    // the rows of the planes, and the VRAM the strips overwrite, as immediate
+    // drawing leaves them
+    DefSyncAll();
+    for (int row = 0; row < h; row++) {
+        const u16* l = &gutter_planes[0][(src_y + row) * PSYZ_GUTTER_MAX];
+        const u16* r = &gutter_planes[1][(src_y + row) * PSYZ_GUTTER_MAX];
+        u16* d = &vram[(dy + row) * VRAM_W];
+        memcpy(&d[dx - gutter_px], l, (size_t)gutter_px * sizeof(u16));
+        memcpy(&d[dx + gutter_w], r, (size_t)gutter_px * sizeof(u16));
+    }
+    return gutter_px;
+}
 
 static void Software_FlushBuffer(void) {}
 static void Software_ResetBuffer(void) {}

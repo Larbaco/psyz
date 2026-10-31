@@ -42,6 +42,53 @@ static struct {
 
 u8* Psyz_SpuGetRam(void) { return spu.ram; }
 
+// Host mixer buses (psyz/spu.h). Kept outside `spu` so a reset does not
+// forget what the host configured. Unity everywhere is the stock mix.
+static int bus_gain[PSYZ_SPU_NUM_BUSES + 1] = {
+    PSYZ_SPU_GAIN_UNITY, PSYZ_SPU_GAIN_UNITY, PSYZ_SPU_GAIN_UNITY,
+    PSYZ_SPU_GAIN_UNITY, PSYZ_SPU_GAIN_UNITY};
+static int bus_stats_on;
+static PsyzSpuBusStats bus_stats[PSYZ_SPU_NUM_BUSES + 1];
+
+// libsnd side: the bus a freshly keyed voice belongs to (libsnd.c)
+int psyz_snd_voice_bus(int voice);
+
+static int clamp_gain(int gain) {
+    if (gain < 0)
+        return 0;
+    if (gain > PSYZ_SPU_GAIN_UNITY)
+        return PSYZ_SPU_GAIN_UNITY;
+    return gain;
+}
+
+void Psyz_SpuSetBusGain(int bus, int gain) {
+    if (bus >= 0 && bus < PSYZ_SPU_NUM_BUSES)
+        bus_gain[bus] = clamp_gain(gain);
+}
+
+void Psyz_SpuSetCdGain(int gain) {
+    bus_gain[PSYZ_SPU_BUS_CD] = clamp_gain(gain);
+}
+
+void Psyz_SpuSetVoiceBus(int voice, int bus) {
+    if (voice >= 0 && voice < PSYZ_SPU_NUM_VOICES && bus >= 0 &&
+        bus < PSYZ_SPU_NUM_BUSES)
+        spu.voice[voice].bus = (u8)bus;
+}
+
+void Psyz_SpuEnableBusStats(int enable) {
+    memset(bus_stats, 0, sizeof(bus_stats));
+    bus_stats_on = enable != 0;
+}
+
+void Psyz_SpuGetBusStats(PsyzSpuBusStats out[PSYZ_SPU_NUM_BUSES + 1]) {
+    memcpy(out, bus_stats, sizeof(bus_stats));
+}
+
+static inline int bus_scale(int sample, int gain) {
+    return gain == PSYZ_SPU_GAIN_UNITY ? sample : (sample * gain) >> 15;
+}
+
 void Psyz_SpuInit(void) {
     if (spu.initialized)
         return;
@@ -119,6 +166,7 @@ void Psyz_SpuMemWrite(unsigned int offset, const void* src, unsigned int size) {
 
 static void spu_key_on_voice(int v) {
     spu_voice_key_on(&spu.voice[v], &_spu_RXX->rxx.voice[v]);
+    spu.voice[v].bus = (u8)psyz_snd_voice_bus(v);
 }
 
 void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
@@ -336,6 +384,11 @@ static void spu_tick(short* out) {
 
     // decode+resample, scale volume by ADSR envelope, then mix voices
     short v1_sample = 0, v3_sample = 0;
+    int bus_in_l[PSYZ_SPU_NUM_BUSES + 1] = {0};
+    int bus_in_r[PSYZ_SPU_NUM_BUSES + 1] = {0};
+    int bus_out_l[PSYZ_SPU_NUM_BUSES + 1] = {0};
+    int bus_out_r[PSYZ_SPU_NUM_BUSES + 1] = {0};
+    int bus_n[PSYZ_SPU_NUM_BUSES + 1] = {0};
     for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
         if (!spu.voice[v].active)
             continue;
@@ -354,6 +407,18 @@ static void spu_tick(short* out) {
         {
             int voice_left = (s * voice_vol(rxx->voice[v].volume.left)) >> 15;
             int voice_right = (s * voice_vol(rxx->voice[v].volume.right)) >> 15;
+            const int bus = spu.voice[v].bus;
+            if (bus_stats_on) {
+                bus_in_l[bus] += voice_left;
+                bus_in_r[bus] += voice_right;
+                bus_n[bus]++;
+            }
+            voice_left = bus_scale(voice_left, bus_gain[bus]);
+            voice_right = bus_scale(voice_right, bus_gain[bus]);
+            if (bus_stats_on) {
+                bus_out_l[bus] += voice_left;
+                bus_out_r[bus] += voice_right;
+            }
             left_sum += voice_left;
             right_sum += voice_right;
             if ((v < 16 && (rxx->rev_mode[0] & (1u << v))) ||
@@ -368,6 +433,11 @@ static void spu_tick(short* out) {
     if (!(spucnt & SPU_CTRL_MASK_MUTE_SPU)) {
         left_sum = right_sum = 0;
         reverb_input_left = reverb_input_right = 0;
+        memset(bus_in_l, 0, sizeof(bus_in_l));
+        memset(bus_in_r, 0, sizeof(bus_in_r));
+        memset(bus_out_l, 0, sizeof(bus_out_l));
+        memset(bus_out_r, 0, sizeof(bus_out_r));
+        memset(bus_n, 0, sizeof(bus_n));
     }
 
     reverb_tick(
@@ -377,8 +447,45 @@ static void spu_tick(short* out) {
 
     // Mix CD audio per SPUCNT and cd_vol registers.
     if (spucnt & SPU_CTRL_MASK_CD_AUDIO_ENABLE) {
-        left_sum += (cd_left * rxx->cd_vol.left) >> 15;
-        right_sum += (cd_right * rxx->cd_vol.right) >> 15;
+        int cd_mix_left = (cd_left * rxx->cd_vol.left) >> 15;
+        int cd_mix_right = (cd_right * rxx->cd_vol.right) >> 15;
+        if (bus_stats_on) {
+            bus_in_l[PSYZ_SPU_BUS_CD] = cd_mix_left;
+            bus_in_r[PSYZ_SPU_BUS_CD] = cd_mix_right;
+            bus_n[PSYZ_SPU_BUS_CD] = 1;
+        }
+        cd_mix_left = bus_scale(cd_mix_left, bus_gain[PSYZ_SPU_BUS_CD]);
+        cd_mix_right = bus_scale(cd_mix_right, bus_gain[PSYZ_SPU_BUS_CD]);
+        if (bus_stats_on) {
+            bus_out_l[PSYZ_SPU_BUS_CD] = cd_mix_left;
+            bus_out_r[PSYZ_SPU_BUS_CD] = cd_mix_right;
+        }
+        left_sum += cd_mix_left;
+        right_sum += cd_mix_right;
+    }
+
+    if (bus_stats_on) {
+        for (int b = 0; b <= PSYZ_SPU_NUM_BUSES; b++) {
+            PsyzSpuBusStats* st = &bus_stats[b];
+            long long il = bus_in_l[b], ir = bus_in_r[b];
+            long long ol = bus_out_l[b], or_ = bus_out_r[b];
+            int ipk = (int)(il < 0 ? -il : il);
+            int ipr = (int)(ir < 0 ? -ir : ir);
+            int opk = (int)(ol < 0 ? -ol : ol);
+            int opr = (int)(or_ < 0 ? -or_ : or_);
+            st->frames++;
+            st->active += (unsigned)bus_n[b];
+            st->in_energy += (unsigned long long)(il * il + ir * ir);
+            st->out_energy += (unsigned long long)(ol * ol + or_ * or_);
+            if (ipr > ipk)
+                ipk = ipr;
+            if (opr > opk)
+                opk = opr;
+            if (ipk > st->in_peak)
+                st->in_peak = ipk;
+            if (opk > st->out_peak)
+                st->out_peak = opk;
+        }
     }
 
     out[0] = clamp16((left_sum * clamp15(rxx->main_vol.left)) >> 14);

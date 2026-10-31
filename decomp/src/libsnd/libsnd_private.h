@@ -285,6 +285,7 @@ int _SsReadDeltaValue(short seq_access_num, short seq_num);
 char _SsVmAlloc(short voice);
 void vmNoiseOn(char voice);
 void vmNoiseOff(char voice);
+unsigned short note2pitch(void);
 unsigned short note2pitch2(unsigned short note, unsigned short fine);
 void _SsVmKeyOnNow(unsigned short vagCount, unsigned short pitch);
 int _SsVmVSetUp(short vabId, short prog);

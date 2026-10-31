@@ -139,6 +139,82 @@ unsigned char* Psyz_SpuGetRam(void);
  */
 void Psyz_SpuPullSamples(short* out, int num_frames);
 
+/**
+ * @name Mixer buses (host extension, not a PS1 feature)
+ *
+ * The PS1 SPU has a single voice mix. This emulator lets the host give each
+ * voice a bus and each bus its own gain, so a port can offer separate music
+ * and sound-effect volumes. A voice takes its bus when it is keyed on and
+ * keeps it until the next key-on. Every bus defaults to unity gain, and a
+ * unity gain leaves the mix bit-identical to a build without buses.
+ * @{
+ */
+#define PSYZ_SPU_NUM_BUSES 4       /**< voice buses 0..3; bus 0 is the default */
+#define PSYZ_SPU_BUS_CD 4          /**< stats index of the CD/XA input */
+#define PSYZ_SPU_GAIN_UNITY 0x8000 /**< Q15 gain 1.0 */
+
+/**
+ * @brief Route a libsnd sequence track to a bus
+ *
+ * Voices started by the SEP/SEQ player for track (seq_access_num, sep_num)
+ * take this bus at key-on. Voices that libsnd starts directly (SsUtKeyOn) and
+ * tracks never assigned stay on bus 0.
+ *
+ * @param seq_access_num SEQ access number returned by SsSepOpen
+ * @param sep_num Track number within the SEP
+ * @param bus 0..PSYZ_SPU_NUM_BUSES-1 (anything else is ignored)
+ */
+void Psyz_SndSetSeqBus(short seq_access_num, short sep_num, int bus);
+
+/**
+ * @brief Set the bus of a voice until its next key-on (tests, direct use)
+ */
+void Psyz_SpuSetVoiceBus(int voice, int bus);
+
+/**
+ * @brief Set a bus gain
+ *
+ * Applied to each voice's left/right contribution after the voice volume
+ * registers, so it also scales that voice's reverb send. Survives
+ * Psyz_SpuReset.
+ *
+ * @param bus 0..PSYZ_SPU_NUM_BUSES-1
+ * @param gain Q15, PSYZ_SPU_GAIN_UNITY is 1.0; clamped to 0..UNITY
+ */
+void Psyz_SpuSetBusGain(int bus, int gain);
+
+/**
+ * @brief Set the gain of the CD/XA input (movie audio), same format
+ */
+void Psyz_SpuSetCdGain(int gain);
+
+/**
+ * @brief Per-bus mixer statistics for tests and diagnostics
+ *
+ * Counted per output frame while enabled. "in" is the contribution before
+ * the bus gain, "out" after it. The energies are sums of squares of the left
+ * and right samples.
+ */
+typedef struct PsyzSpuBusStats {
+    unsigned long long frames;     /**< output frames counted */
+    unsigned long long active;     /**< voice-frames mixed on this bus */
+    unsigned long long in_energy;  /**< sum of squares before the bus gain */
+    unsigned long long out_energy; /**< sum of squares after the bus gain */
+    int in_peak;                   /**< largest |sample| before the gain */
+    int out_peak;                  /**< largest |sample| after the gain */
+} PsyzSpuBusStats;
+
+/** @brief Start or stop counting, clearing the counters either way */
+void Psyz_SpuEnableBusStats(int enable);
+
+/**
+ * @brief Copy the counters of buses 0..PSYZ_SPU_NUM_BUSES-1 and the CD input
+ *
+ * @param out PSYZ_SPU_NUM_BUSES + 1 entries; the last one is PSYZ_SPU_BUS_CD
+ */
+void Psyz_SpuGetBusStats(PsyzSpuBusStats out[PSYZ_SPU_NUM_BUSES + 1]);
+/** @} */
+
 #ifdef __cplusplus
 }
 #endif

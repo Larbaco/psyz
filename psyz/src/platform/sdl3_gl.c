@@ -801,6 +801,16 @@ unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
 
 unsigned Psyz_VideoGetInternalResolution(void) { return internal_res; }
 
+// side gutters are only implemented by the sdl3_gpu backend
+int Psyz_VideoSetGutter(unsigned px) { return px == 0 ? 0 : -1; }
+
+unsigned Psyz_VideoGetGutter(void) { return 0; }
+
+int Psyz_VideoCopyGutters(int src_y, int h, int dx, int dy) {
+    (void)src_y; (void)h; (void)dx; (void)dy;
+    return 0; // no gutters here, see Psyz_VideoSetGutter
+}
+
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
     if (multiplier < 1) {
         return -1;

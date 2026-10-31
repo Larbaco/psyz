@@ -12,7 +12,15 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/module.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ios.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/web.cmake)
 
-if(NOT PSP)
+# Nintendo Switch (devkitA64/libnx): the platform layer (file/log/os/audio/input)
+# and the renderer are supplied by the consumer — see the dw3-switch port's
+# platforms/switch/psyz_backend. So this build needs neither SDL nor the desktop
+# platform files. Detection is by target, so no consumer has to opt in.
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(PSYZ_NINTENDO_SWITCH ON)
+endif()
+
+if(NOT PSP AND NOT PSYZ_NINTENDO_SWITCH)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -187,6 +195,7 @@ set(PSYZ_SOURCES
     ../decomp/src/libsnd/vs_vtc.c
     ../decomp/src/libc2/rand.c
     src/psyz/libsnd.c
+    src/psyz/midiread_host.c
     src/psyz/libsn.c
     src/psyz/libpress.c
     ../decomp/src/libpress/libpress.c
@@ -287,6 +296,12 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         message(FATAL_ERROR "UIKit framework not found for iOS target")
     endif()
     list(APPEND PSYZ_LIBS ${PSYZ_UIKIT_FRAMEWORK})
+elseif(PSYZ_NINTENDO_SWITCH)
+    # libnx provides the target; there is no SDL and no dlopen. The platform
+    # symbols and the Draw_*/Psyz_Video* renderer come from the consumer, which
+    # links them into its own executable. The software SPU mixer is portable C
+    # and stays here, so a consumer only has to supply an audio device.
+    list(APPEND PSYZ_SOURCES src/psyz/psyz_spu.c)
 elseif(PSP)
     # The pspdev toolchain provides the SDK include/link paths; the GE, the
     # display, the controller and the audio channel are driven directly, so
@@ -325,7 +340,13 @@ else()
     endif()
 endif()
 
-if(NOT PSP AND NOT EMSCRIPTEN AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
+if(PSYZ_NINTENDO_SWITCH)
+    # Portable CPU rasterizer — no SDL despite the file name; it only needs
+    # psyz.h and draw.h. The Switch renderer drives its DrawBackend vtable and
+    # presents SoftwareRasterizer_GetVram(). Nothing else in-tree consumes this
+    # file, so building it here is also what gets it exercised.
+    list(APPEND PSYZ_SOURCES src/platform/sdl3_software.c)
+elseif(NOT PSP AND NOT EMSCRIPTEN AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
     list(APPEND PSYZ_SOURCES src/platform/sdl3_software.c)
 endif()
 
@@ -340,7 +361,11 @@ if(PSYZ_IS_IOS)
 endif()
 target_include_directories(psyz PUBLIC ${PSYZ_INC})
 set_property(TARGET psyz PROPERTY PSYZ_EXPORT_TO_MODULES 1)
-if(PSP)
+if(PSYZ_NINTENDO_SWITCH)
+    # Nothing to link here: the consumer links libnx/EGL and supplies both the
+    # platform layer and the renderer. PSYZ_LIBS is empty on this target, and
+    # target_link_libraries() rejects an empty call.
+elseif(PSP)
     target_link_libraries(psyz PUBLIC ${PSYZ_LIBS})
 else()
     target_link_libraries(psyz PUBLIC SDL3::SDL3 ${PSYZ_LIBS})
