@@ -1084,6 +1084,113 @@ static SDL_GPUTexture* PrepareRgb24(void) {
     return rgb24_texture;
 }
 
+// Output filter (Psyz_VideoSetOutputFilter). Bilinear is a linear final blit.
+// Sharp bilinear first blits the picture with NEAREST to the largest whole
+// multiple of its size that fits the destination, then blits that with LINEAR:
+// the plateaus keep the hard pixels and only the seams between two source
+// pixels (about one destination pixel wide) are smoothed.
+static PsyzOutputFilter output_filter = PSYZ_OUTPUT_NEAREST;
+static SDL_GPUTexture* prescale_tex;
+static Uint32 prescale_w, prescale_h;
+#define PRESCALE_MAX 16
+
+int Psyz_VideoSetOutputFilter(PsyzOutputFilter filter) {
+    if (filter != PSYZ_OUTPUT_NEAREST && filter != PSYZ_OUTPUT_BILINEAR &&
+        filter != PSYZ_OUTPUT_SHARP) {
+        return -1;
+    }
+    output_filter = filter;
+    return 0;
+}
+
+PsyzOutputFilter Psyz_VideoGetOutputFilter(void) { return output_filter; }
+
+static void ReleasePrescale(void) {
+    if (prescale_tex) {
+        SDL_ReleaseGPUTexture(device, prescale_tex);
+        prescale_tex = NULL;
+    }
+    prescale_w = prescale_h = 0;
+}
+
+static bool EnsurePrescale(Uint32 w, Uint32 h) {
+    if (prescale_tex && prescale_w == w && prescale_h == h) {
+        return true;
+    }
+    ReleasePrescale();
+    const SDL_GPUTextureCreateInfo info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage =
+            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = w,
+        .height = h,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    prescale_tex = SDL_CreateGPUTexture(device, &info);
+    if (!prescale_tex) {
+        WARNF("prescale texture %ux%u failed, sharp bilinear off: %s", w, h,
+              SDL_GetError());
+        return false;
+    }
+    prescale_w = w;
+    prescale_h = h;
+    return true;
+}
+
+// The final blit of the picture `src` into the rectangle `d` of the swapchain
+// (cleared to black first), with the chosen output filter.
+static void BlitOutput(SDL_GPUCommandBuffer* cmd, SDL_GPUBlitRegion src,
+                       SDL_GPUTexture* swapchain, SDL_Rect d) {
+    SDL_GPUFilter filter = SDL_GPU_FILTER_NEAREST;
+    if (output_filter != PSYZ_OUTPUT_NEAREST && src.w > 0 && src.h > 0 &&
+        d.w > 0 && d.h > 0) {
+        filter = SDL_GPU_FILTER_LINEAR;
+        if (output_filter == PSYZ_OUTPUT_SHARP) {
+            Uint32 p = (Uint32)d.w / src.w;
+            const Uint32 py = (Uint32)d.h / src.h;
+            if (py < p) {
+                p = py;
+            }
+            if (p > PRESCALE_MAX) {
+                p = PRESCALE_MAX;
+            }
+            if (p >= 2 && EnsurePrescale(src.w * p, src.h * p)) {
+                const SDL_GPUBlitInfo pre = {
+                    .source = src,
+                    .destination = {.texture = prescale_tex,
+                                    .w = prescale_w,
+                                    .h = prescale_h},
+                    .load_op = SDL_GPU_LOADOP_DONT_CARE,
+                    .filter = SDL_GPU_FILTER_NEAREST,
+                };
+                SDL_BlitGPUTexture(cmd, &pre);
+                src = (SDL_GPUBlitRegion){.texture = prescale_tex,
+                                          .w = prescale_w,
+                                          .h = prescale_h};
+            }
+        }
+    }
+    const SDL_GPUBlitInfo blit = {
+        .source = src,
+        .destination =
+            {
+                .texture = swapchain,
+                .x = (Uint32)d.x,
+                .y = (Uint32)d.y,
+                .w = (Uint32)d.w,
+                .h = (Uint32)d.h,
+            },
+        // clear the swapchain to black first so the horizontal or
+        // vertical bars around the game output are black
+        .load_op = SDL_GPU_LOADOP_CLEAR,
+        .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
+        .filter = filter,
+    };
+    SDL_BlitGPUTexture(cmd, &blit);
+}
+
 static void PlatformBackend_Present(void) {
     if (!sdl3_window && !InitPlatform()) {
         return;
@@ -1181,23 +1288,7 @@ static void PlatformBackend_Present(void) {
                 WndSize win = {(int)sc_w, (int)sc_h};
                 SDL_Rect dst = FitGameToWindow(game_aspect, win);
 
-                const SDL_GPUBlitInfo blit = {
-                    .source = src,
-                    .destination =
-                        {
-                            .texture = swapchain,
-                            .x = (Uint32)dst.x,
-                            .y = (Uint32)dst.y,
-                            .w = (Uint32)dst.w,
-                            .h = (Uint32)dst.h,
-                        },
-                    // clear the swapchain to black first so the horizontal or
-                    // vertical bars around the game output are black
-                    .load_op = SDL_GPU_LOADOP_CLEAR,
-                    .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
-                    .filter = SDL_GPU_FILTER_NEAREST,
-                };
-                SDL_BlitGPUTexture(cmd, &blit);
+                BlitOutput(cmd, src, swapchain, dst);
             }
             if (overlay_frame_cb) {
                 overlay_frame_cb();
@@ -1267,6 +1358,7 @@ static void QuitPlatform(void) {
             gutter_render = NULL;
             gutter_render_res = 0;
         }
+        ReleasePrescale();
         ReleaseCanvases();
         if (vram_sampler) {
             SDL_ReleaseGPUSampler(device, vram_sampler);

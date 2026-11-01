@@ -290,6 +290,32 @@ unsigned Psyz_VideoGetInternalResolution(void);
  */
 int Psyz_VideoSetGutter(unsigned px);
 
+/** How the presented picture is stretched to the window or screen */
+typedef enum {
+    PSYZ_OUTPUT_NEAREST = 0,  ///< nearest neighbour (default, hard pixels)
+    PSYZ_OUTPUT_BILINEAR = 1, ///< plain bilinear
+    PSYZ_OUTPUT_SHARP = 2,    ///< sharp bilinear: an integer nearest prescale,
+                              ///< then bilinear to the target size, so pixels
+                              ///< stay crisp and only the seams are smoothed
+} PsyzOutputFilter;
+
+/**
+ * @brief Choose the filter used to stretch the picture to the output
+ *
+ * Applies to the final presentation only, not to the emulated VRAM, the
+ * internal resolution or readbacks. Targets without it accept only
+ * PSYZ_OUTPUT_NEAREST and return -1 for the others.
+ *
+ * @param filter one of PsyzOutputFilter
+ * @return 0 on success, -1 if the filter is unknown or unsupported
+ */
+int Psyz_VideoSetOutputFilter(PsyzOutputFilter filter);
+
+/**
+ * @brief Get the current output filter
+ */
+PsyzOutputFilter Psyz_VideoGetOutputFilter(void);
+
 /**
  * @brief Get the current side gutter width
  *
