@@ -14,6 +14,12 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
 
 unsigned Psyz_VideoGetInternalResolution(void) { return 1; }
 
+int Psyz_VideoReserveInternalResolution(unsigned multiplier) {
+    (void)multiplier;
+    return 0;
+}
+
+
 int Psyz_VideoSetGutter(unsigned px) { return px == 0 ? 0 : -1; }
 
 unsigned Psyz_VideoGetGutter(void) { return 0; }

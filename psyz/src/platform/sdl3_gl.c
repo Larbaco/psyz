@@ -1092,6 +1092,12 @@ unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
 
 unsigned Psyz_VideoGetInternalResolution(void) { return internal_res; }
 
+// The GL backend has no kept targets: the reserve is accepted and ignored (a
+// change of the multiplier still re-creates its targets).
+int Psyz_VideoReserveInternalResolution(unsigned multiplier) {
+    return multiplier > PSYZ_INTERNAL_RES_MAX ? -1 : 0;
+}
+
 // side gutters are only implemented by the sdl3_gpu backend
 int Psyz_VideoSetGutter(unsigned px) { return px == 0 ? 0 : -1; }
 
