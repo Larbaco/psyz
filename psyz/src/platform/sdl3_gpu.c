@@ -113,6 +113,7 @@ static unsigned gutter_px = 0;
 // Psyz_VideoReserveInternalResolution asks for it).
 static SDL_GPUTexture* gutter_render[2] = {NULL, NULL};
 static unsigned gutter_render_res[2] = {0, 0};
+static int gutter_last_slot = -1;  // the slot GetGutterTarget handed out last
 
 static PsyzOverlayInitCB_SDL3GPU overlay_init_cb;
 PsyzOverlayInitCB_SDL3GPU Psyz_OverlayInit_SDL3GPU(
@@ -571,12 +572,32 @@ static void ReleaseGutterSlot(int slot) {
         SDL_ReleaseGPUTexture(device, gutter_render[slot]);
         gutter_render[slot] = NULL;
         gutter_render_res[slot] = 0;
+        if (gutter_last_slot == slot) {
+            gutter_last_slot = -1;
+        }
     }
 }
+
+// The target the gutters draw into at the multiplier in force, or NULL when none
+// has been made yet (it is made on first use, by GetGutterTarget).
+static SDL_GPUTexture* ActiveGutterTarget(void) {
+    const int slot = internal_res <= 1 ? 0 : 1;
+    return gutter_render[slot] && gutter_render_res[slot] == internal_res
+               ? gutter_render[slot]
+               : NULL;
+}
+
+static void ClearTargetRect(SDL_GPUTexture* texture, int x, int y, int w,
+                            int h, u_char r, u_char g, u_char b);
 
 static SDL_GPUTexture* GetGutterTarget(void) {
     const int slot = internal_res <= 1 ? 0 : 1;
     if (gutter_render[slot] && gutter_render_res[slot] == internal_res) {
+        if (slot != gutter_last_slot) {
+            // it was idle while the other multiplier drew: its gutters are old
+            gutter_last_slot = slot;
+            ClearTargetRect(gutter_render[slot], 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
+        }
         return gutter_render[slot];
     }
     ReleaseGutterSlot(slot);
@@ -596,6 +617,7 @@ static SDL_GPUTexture* GetGutterTarget(void) {
         return NULL;
     }
     gutter_render_res[slot] = internal_res;
+    gutter_last_slot = slot;
     // start black: a fresh texture has undefined contents
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (cmd) {
@@ -1532,8 +1554,8 @@ int Psyz_VideoSetGutter(unsigned px) {
     }
     if (px != gutter_px) {
         Draw_FlushBuffer(); // pending prims belong to the old gutter
-        if (gutter_render) {
-            ClearTargetRect(gutter_render, 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
+        if (ActiveGutterTarget()) {
+            ClearTargetRect(ActiveGutterTarget(), 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
         }
         gutter_px = px;
     }
@@ -1642,12 +1664,12 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
         SyncCanvasToVram(fb_index);
         DiscardCanvas(fb_index);
     }
-    if (moved && gutter_px > 0 && gutter_render) {
+    if (moved && gutter_px > 0 && ActiveGutterTarget()) {
         // a flip: the buffer drawn next starts with black gutters
-        ClearTargetRect(gutter_render, 0, 0, VRAM_W, display_area.y, 0, 0, 0);
+        SDL_GPUTexture* gutters = ActiveGutterTarget();
+        ClearTargetRect(gutters, 0, 0, VRAM_W, display_area.y, 0, 0, 0);
         int below = display_area.y + display_size.y;
-        ClearTargetRect(
-            gutter_render, 0, below, VRAM_W, VRAM_H - below, 0, 0, 0);
+        ClearTargetRect(gutters, 0, below, VRAM_W, VRAM_H - below, 0, 0, 0);
     }
     ApplyDisplayPendingChanges();
 }
