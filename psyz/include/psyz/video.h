@@ -262,6 +262,26 @@ PsyzRect Psyz_VideoGetDrawArea(void);
 int Psyz_VideoSetInternalResolution(unsigned multiplier);
 
 /**
+ * @brief Keep the targets of an internal resolution alive while a lower one is
+ * in use
+ *
+ * Changing the multiplier normally frees the old render targets and creates the
+ * new ones on the next presented frame, which is a one-time allocation hitch.
+ * A front-end that switches between native and a scaled resolution at run time
+ * (for example, native while fast-forward is on) reserves the scaled
+ * multiplier once: the targets are created here (or when the window exists) and
+ * stay allocated while Psyz_VideoSetInternalResolution selects 1, so the switch
+ * back only copies VRAM into the kept target. Costs the GPU memory of the
+ * reserved targets.
+ *
+ * Same support as Psyz_VideoSetInternalResolution (a no-op without it).
+ *
+ * @param multiplier 0 or 1 to release the reserve, or 2 to PSYZ_INTERNAL_RES_MAX
+ * @return 0 on success, -1 if multiplier > PSYZ_INTERNAL_RES_MAX
+ */
+int Psyz_VideoReserveInternalResolution(unsigned multiplier);
+
+/**
  * @brief Get the current internal resolution multiplier
  *
  * @return current multiplier (>= 1)
