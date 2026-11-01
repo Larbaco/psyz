@@ -6,6 +6,7 @@
 #include <psyz.h>
 #include <kernel.h>
 #include <libapi.h>
+#include <libetc.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -273,4 +274,14 @@ ZTEST(truncation, nextfile_truncates_long_filename) {
     zexpect_str_eq(TRUNCATED_NAME_19, d[1].name);
     zprintf("Truncated name length should be exactly 19\n");
     zexpect_u32_eq(19, strlen(d[1].name));
+}
+
+ZTEST(libetc, scratchpad_words) {
+    u_long* base = getScratchAddr(0);
+    *getScratchAddr(1) = 0x12345678;
+    *getScratchAddr(255) = 0x9ABCDEF0;
+    zexpect_ptr_eq(base + 1, getScratchAddr(1));
+    zexpect_ptr_eq(base + 255, getScratchAddr(255));
+    zexpect_u32_eq(0x12345678, base[1]);
+    zexpect_u32_eq(0x9ABCDEF0, base[255]);
 }

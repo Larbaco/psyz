@@ -80,6 +80,17 @@ static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
 static SDL_GPUGraphicsPipeline* pipe_clear = NULL;
 static SDL_GPUCommandBuffer* pending_cmd = NULL;
 
+#define READBACK_ALIGN 512 // D3D12 texture copy placement alignment
+typedef struct {
+    Uint32 offset;
+    int w, h;
+    u_long* dst;
+} Readback;
+static Readback readbacks[MAX_PENDING_STORES];
+static int n_readbacks = 0;
+static Uint32 readback_used = 0;
+static SDL_GPUFence* readback_fence = NULL;
+
 static Posi display_area = {0, 0};
 static Posi display_size = {256, 240};
 static Posi cur_display_size = {-1, -1};
@@ -422,7 +433,7 @@ static bool CreateGpuResources(void) {
     SDL_GPUShader* psx_fs = CreateShader(
         psx_frag, psx_frag_len, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
     SDL_GPUShader* clear_vs = CreateShader(
-        clear_vert, clear_vert_len, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
+        clear_vert, clear_vert_len, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
     SDL_GPUShader* clear_fs = CreateShader(
         clear_frag, clear_frag_len, SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0);
     bool shaders_ok = psx_vs && psx_fs && clear_vs && clear_fs;
@@ -450,7 +461,7 @@ static bool CreateGpuResources(void) {
     return shaders_ok && pipe_clear;
 }
 
-bool InitPlatform() {
+bool InitPlatform(void) {
     if (is_platform_initialized) {
         return is_platform_init_successful;
     }
@@ -505,6 +516,7 @@ bool InitPlatform() {
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
+    Sdl3Common_VideoInit();
     if (overlay_init_cb) {
         overlay_init_cb(sdl3_window, device);
     }
@@ -703,6 +715,266 @@ static bool CreateScaledVramTarget(unsigned n) {
     return true;
 }
 
+static SDL_Rect ScaleRect(SDL_Rect r, int n) {
+    return (SDL_Rect){r.x * n, r.y * n, r.w * n, r.h * n};
+}
+
+static void Blit(SDL_GPUTexture* src, SDL_Rect s, SDL_GPUTexture* dst,
+                 SDL_Rect d, bool clear) {
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (!cmd || s.w <= 0 || s.h <= 0 || d.w <= 0 || d.h <= 0) {
+        return;
+    }
+    const SDL_GPUBlitInfo blit = {
+        .source = {.texture = src,
+                   .x = (Uint32)s.x,
+                   .y = (Uint32)s.y,
+                   .w = (Uint32)s.w,
+                   .h = (Uint32)s.h},
+        .destination = {.texture = dst,
+                        .x = (Uint32)d.x,
+                        .y = (Uint32)d.y,
+                        .w = (Uint32)d.w,
+                        .h = (Uint32)d.h},
+        .load_op = clear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD,
+        .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
+        .filter = SDL_GPU_FILTER_NEAREST,
+    };
+    SDL_BlitGPUTexture(cmd, &blit);
+}
+
+// area is in VRAM pixels for vram_render and in canvas pixels for a canvas
+static void FillRect(SDL_GPUTexture* target, PsyzSize target_size,
+                     SDL_Rect area, u8 r, u8 g, u8 b) {
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (!cmd || area.w <= 0 || area.h <= 0) {
+        return;
+    }
+
+    Vertex quad[4] = {0};
+    quad[0].x = (short)area.x;
+    quad[0].y = (short)area.y;
+    quad[1].x = (short)(area.x + area.w);
+    quad[1].y = (short)area.y;
+    quad[2].x = (short)area.x;
+    quad[2].y = (short)(area.y + area.h);
+    quad[3].x = (short)(area.x + area.w);
+    quad[3].y = (short)(area.y + area.h);
+    for (int i = 0; i < 4; i++) {
+        quad[i].r = r;
+        quad[i].g = g;
+        quad[i].b = b;
+        quad[i].a = 0;
+    }
+
+    Vertex* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, true);
+    if (!map) {
+        ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
+        return;
+    }
+    memcpy(map, quad, sizeof(quad));
+    SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
+
+    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+    const SDL_GPUTransferBufferLocation src = {.transfer_buffer = vtx_transfer};
+    const SDL_GPUBufferRegion dst = {
+        .buffer = clear_vbuf, .size = sizeof(quad)};
+    SDL_UploadToGPUBuffer(copy, &src, &dst, true);
+    SDL_EndGPUCopyPass(copy);
+
+    const SDL_GPUColorTargetInfo target_info = {
+        .texture = target,
+        .load_op = SDL_GPU_LOADOP_LOAD,
+        .store_op = SDL_GPU_STOREOP_STORE,
+    };
+    SDL_GPURenderPass* pass =
+        SDL_BeginGPURenderPass(cmd, &target_info, 1, NULL);
+    SDL_BindGPUGraphicsPipeline(pass, pipe_clear);
+    const float target_ubo[2] = {(float)target_size.w, (float)target_size.h};
+    SDL_PushGPUVertexUniformData(cmd, 0, target_ubo, sizeof(target_ubo));
+    const SDL_GPUBufferBinding vb = {.buffer = clear_vbuf};
+    SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+    SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+    SDL_EndGPURenderPass(pass);
+}
+
+// uploads a w*h part at (sx, sy) of the image in tex_upload_transfer
+static void UploadImage(SDL_GPUTexture* tex, int x, int y, int pitch, int sx,
+                        int sy, int w, int h) {
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (!cmd) {
+        return;
+    }
+    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+    const SDL_GPUTextureTransferInfo src = {
+        .transfer_buffer = tex_upload_transfer,
+        .offset = (Uint32)((sy * pitch + sx) * 4),
+        .pixels_per_row = (Uint32)pitch,
+        .rows_per_layer = (Uint32)h,
+    };
+    const SDL_GPUTextureRegion dst = {
+        .texture = tex,
+        .x = (Uint32)x,
+        .y = (Uint32)y,
+        .w = (Uint32)w,
+        .h = (Uint32)h,
+        .d = 1,
+    };
+    SDL_UploadToGPUTexture(copy, &src, &dst, false);
+    SDL_EndGPUCopyPass(copy);
+}
+
+static SDL_GPUTexture* canvas_tex[FB_COUNT];
+static unsigned canvas_res;  // internal resolution of canvas_tex, 0 for none
+static PsyzSize canvas_size; // native resolution of canvas_tex, in game pixels
+
+static void CopyVramToCanvas(int fb_index, SDL_Rect vram) {
+    const FbOrigin s = canvas_shift[fb_index];
+    const SDL_Rect fb = GetFbRect(fb_index);
+    const SDL_Rect tex = {-s.x, -s.y, canvas_size.w, canvas_size.h};
+    if (!SDL_GetRectIntersection(&vram, &fb, &vram) ||
+        !SDL_GetRectIntersection(&vram, &tex, &vram)) {
+        return;
+    }
+    const SDL_Rect dst = {vram.x + s.x, vram.y + s.y, vram.w, vram.h};
+    Blit(GetRenderTarget(), ScaleRect(vram, (int)internal_res),
+         canvas_tex[fb_index], ScaleRect(dst, (int)canvas_res), false);
+}
+
+static void SyncCanvasToVram(int fb_index) {
+    const SDL_Rect r = canvas_dirty[fb_index];
+    const FbOrigin s = canvas_shift[fb_index];
+    if (r.w <= 0 || r.h <= 0 || !canvas_tex[fb_index]) {
+        return;
+    }
+    const SDL_Rect c =
+        ScaleRect((SDL_Rect){r.x + s.x, r.y + s.y, r.w, r.h}, (int)canvas_res);
+    Blit(canvas_tex[fb_index], c, vram_render, r, false);
+    if (internal_res > 1 && scaled_vram_render) {
+        Blit(canvas_tex[fb_index], c, scaled_vram_render,
+             ScaleRect(r, (int)internal_res), false);
+    }
+    MarkVramDirty(r);
+    canvas_dirty[fb_index] = (SDL_Rect){0, 0, 0, 0};
+}
+
+static void SyncDirtyCanvases(const SDL_Rect* region) {
+    for (int i = 0; i < fb_origin_count; i++) {
+        if (!region || SDL_HasRectIntersection(region, &canvas_dirty[i])) {
+            SyncCanvasToVram(i);
+        }
+    }
+}
+
+// VRAM becomes the only copy of the framebuffers outside of native mode
+static void LeaveNative(void) {
+    for (int i = 0; i < fb_origin_count; i++) {
+        SyncCanvasToVram(i);
+        DiscardCanvas(i);
+    }
+}
+
+static void ReleaseCanvases(void) {
+    for (int i = 0; i < FB_COUNT; i++) {
+        if (canvas_tex[i]) {
+            SDL_ReleaseGPUTexture(device, canvas_tex[i]);
+            canvas_tex[i] = NULL;
+        }
+        DiscardCanvas(i);
+    }
+    canvas_res = 0;
+    canvas_size = (PsyzSize){0, 0};
+}
+
+static bool EnsureCanvases(const VideoLayout* l) {
+    if (canvas_tex[0] && canvas_res == internal_res &&
+        canvas_size.w == l->canvas.w && canvas_size.h == l->canvas.h) {
+        return true;
+    }
+    SyncDirtyCanvases(NULL);
+    ReleaseCanvases();
+    SDL_GPUTextureCreateInfo info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage =
+            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = l->canvas.w * internal_res,
+        .height = l->canvas.h * internal_res,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    for (int i = 0; i < FB_COUNT; i++) {
+        canvas_tex[i] = SDL_CreateGPUTexture(device, &info);
+        if (!canvas_tex[i]) {
+            ERRORF("canvas creation failed (%dx): %s", internal_res,
+                   SDL_GetError());
+            ReleaseCanvases();
+            return false;
+        }
+    }
+    canvas_res = internal_res;
+    canvas_size = l->canvas;
+    return true;
+}
+
+static bool PrepareCanvas(const VideoLayout* l, int fb_index) {
+    if (!EnsureCanvases(l)) {
+        return false;
+    }
+    if (!IsCanvasLayoutCurrent(l, fb_index)) {
+        SyncCanvasToVram(fb_index);
+        FillRect(canvas_tex[fb_index], canvas_size,
+                 (SDL_Rect){0, 0, canvas_size.w, canvas_size.h}, 0, 0, 0);
+        canvas_dirty[fb_index] = (SDL_Rect){0, 0, 0, 0};
+        canvas_shift[fb_index] = GetCanvasShift(l, fb_index);
+        CopyVramToCanvas(fb_index, GetFbRect(fb_index));
+    }
+    return true;
+}
+
+// places the image in tex_upload_transfer on the canvas, past the VRAM edges
+static void CanvasUploadImage(
+    const VideoLayout* l, int fb_index, const PS1_RECT* rect) {
+    const FbOrigin s = canvas_shift[fb_index];
+    const SDL_Rect img = {rect->x + s.x, rect->y + s.y, rect->w, rect->h};
+    const SDL_Rect canvas = {0, 0, l->canvas.w, l->canvas.h};
+    SDL_Rect dst;
+    if (!SDL_GetRectIntersection(&img, &canvas, &dst)) {
+        return;
+    }
+    if (canvas_res == 1) {
+        UploadImage(canvas_tex[fb_index], dst.x, dst.y, rect->w, dst.x - img.x,
+                    dst.y - img.y, dst.w, dst.h);
+        return;
+    }
+    // uploads can't scale: stage in vram_sample, the next textured batch
+    // copies the real VRAM back over it
+    const SDL_Rect staging = {0, 0, dst.w, dst.h};
+    UploadImage(
+        vram_sample, 0, 0, rect->w, dst.x - img.x, dst.y - img.y, dst.w, dst.h);
+    Blit(vram_sample, staging, canvas_tex[fb_index],
+         ScaleRect(dst, (int)canvas_res), false);
+    MarkVramDirty(staging);
+}
+
+// the area the open batch draws on; a prim sampling it must see that batch
+static SDL_Rect PendingBatchRect(void) {
+    if (n_vertices == 0) {
+        return (SDL_Rect){0, 0, 0, 0};
+    }
+    return scissor_rect;
+}
+
+// makes VRAM up to date for readers outside of the draw path
+static void SyncCanvasesForRead(void) {
+    if (res_request.w != 0) {
+        Draw_FlushBuffer();
+        SyncDirtyCanvases(NULL);
+    } else {
+        LeaveNative();
+    }
+}
+
 // ensure scaled VRAM does not exceed max allowed texture size
 static unsigned AdjustInternalRes(unsigned scale) {
     unsigned n = scale;
@@ -720,10 +992,14 @@ static unsigned AdjustInternalRes(unsigned scale) {
 }
 
 static void ApplyPendingInternalRes(void) {
-    if (set_internal_res == internal_res) {
+    if (!sdl3_window || !is_platform_init_successful) {
         return;
     }
-    if (!sdl3_window || !is_platform_init_successful) {
+    if (internal_res_auto) {
+        VideoLayout layout = ResolveVideoLayout();
+        set_internal_res = GetAutoInternalRes(&layout);
+    }
+    if (set_internal_res == internal_res) {
         return;
     }
     unsigned n = AdjustInternalRes(set_internal_res);
@@ -734,6 +1010,7 @@ static void ApplyPendingInternalRes(void) {
     if (n > 1 && !CreateScaledVramTarget(n)) {
         n = 1;
         set_internal_res = 1;
+        internal_res_auto = false;
     }
     if (n > 1) {
         // upscale the whole native VRAM into the freshly created scaled target
@@ -818,6 +1095,18 @@ static void PlatformBackend_Present(void) {
 
     ApplyPendingInternalRes();
 
+    VideoLayout layout = ResolveVideoLayout();
+    const bool native_present =
+        layout.native && !display_rgb24 && !debug_show_vram && disp_on;
+    int fb_index = -1;
+    if (native_present) {
+        fb_index = FindFbByOrigin(display_area.x, display_area.y);
+        if (fb_index >= 0 && !PrepareCanvas(&layout, fb_index)) {
+            fb_index = -1;
+        }
+    } else {
+        SyncCanvasesForRead();
+    }
     SDL_GPUTexture* rgb24_source =
         display_rgb24 && !debug_show_vram && disp_on ? PrepareRgb24() : NULL;
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
@@ -832,7 +1121,7 @@ static void PlatformBackend_Present(void) {
             WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
         }
         if (swapchain) {
-            if (!disp_on) {
+            if (!disp_on || (native_present && fb_index < 0)) {
                 const SDL_GPUColorTargetInfo blank_target = {
                     .texture = swapchain,
                     .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
@@ -842,6 +1131,11 @@ static void PlatformBackend_Present(void) {
                 SDL_GPURenderPass* blank_pass =
                     SDL_BeginGPURenderPass(cmd, &blank_target, 1, NULL);
                 SDL_EndGPURenderPass(blank_pass);
+            } else if (native_present) {
+                const SDL_Rect src = {0, 0, layout.canvas.w * (int)canvas_res,
+                                      layout.canvas.h * (int)canvas_res};
+                Blit(canvas_tex[fb_index], src, swapchain,
+                     GetCanvasPresentRect(&layout, (int)sc_w, (int)sc_h), true);
             } else {
                 const Uint32 n = rgb24_source ? 1 : internal_res;
                 SDL_GPUBlitRegion src = {
@@ -935,6 +1229,12 @@ static void QuitPlatform(void) {
     if (device) {
         SDL_WaitForGPUIdle(device);
         ReleaseFrameFences();
+        if (readback_fence) {
+            SDL_ReleaseGPUFence(device, readback_fence);
+            readback_fence = NULL;
+        }
+        n_readbacks = 0;
+        readback_used = 0;
         for (int i = 0; i < BLEND_COUNT; i++) {
             if (pipe_tri[i]) {
                 SDL_ReleaseGPUGraphicsPipeline(device, pipe_tri[i]);
@@ -967,6 +1267,7 @@ static void QuitPlatform(void) {
             gutter_render = NULL;
             gutter_render_res = 0;
         }
+        ReleaseCanvases();
         if (vram_sampler) {
             SDL_ReleaseGPUSampler(device, vram_sampler);
             vram_sampler = NULL;
@@ -1018,14 +1319,29 @@ void ResetPlatform(void) {
     QuitPlatform();
 }
 
-static bool DownloadVramRegionAsRGBA8888(int x, int y, int w, int h, u8* out) {
+static bool DownloadTextureRegion(
+    SDL_GPUTexture* tex, int x, int y, int w, int h, u8* out) {
+    const Uint32 size = (Uint32)w * (Uint32)h * 4;
+    SDL_GPUTransferBuffer* buf = tex_download_transfer;
+    Draw_ExequeSync(); // pending readbacks share the transfer buffer
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return false;
     }
+    if (size > VRAM_BYTES) {
+        const SDL_GPUTransferBufferCreateInfo info = {
+            .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+            .size = size,
+        };
+        buf = SDL_CreateGPUTransferBuffer(device, &info);
+        if (!buf) {
+            ERRORF("SDL_CreateGPUTransferBuffer: %s", SDL_GetError());
+            return false;
+        }
+    }
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     const SDL_GPUTextureRegion region = {
-        .texture = vram_render,
+        .texture = tex,
         .x = (Uint32)x,
         .y = (Uint32)y,
         .w = (Uint32)w,
@@ -1033,24 +1349,27 @@ static bool DownloadVramRegionAsRGBA8888(int x, int y, int w, int h, u8* out) {
         .d = 1,
     };
     const SDL_GPUTextureTransferInfo transfer = {
-        .transfer_buffer = tex_download_transfer,
+        .transfer_buffer = buf,
     };
     SDL_DownloadFromGPUTexture(copy, &region, &transfer);
     SDL_EndGPUCopyPass(copy);
     SubmitCmdAndWait();
 
-    const u8* map =
-        SDL_MapGPUTransferBuffer(device, tex_download_transfer, false);
-    if (!map) {
+    const u8* map = SDL_MapGPUTransferBuffer(device, buf, false);
+    if (map) {
+        memcpy(out, map, size);
+        SDL_UnmapGPUTransferBuffer(device, buf);
+    } else {
         ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
-        return false;
     }
-    memcpy(out, map, (size_t)w * h * 4);
-    SDL_UnmapGPUTransferBuffer(device, tex_download_transfer);
-    return true;
+    if (buf != tex_download_transfer) {
+        SDL_ReleaseGPUTransferBuffer(device, buf);
+    }
+    return map != NULL;
 }
 
-static unsigned char* AllocRgb888Region(int x, int y, int w, int h) {
+static unsigned char* AllocRgb888Region(
+    SDL_GPUTexture* tex, int x, int y, int w, int h) {
     if (!device || !vram_render) {
         ERRORF("GPU device not initialized");
         return NULL;
@@ -1064,7 +1383,7 @@ static unsigned char* AllocRgb888Region(int x, int y, int w, int h) {
         return NULL;
     }
 
-    if (!DownloadVramRegionAsRGBA8888(x, y, w, h, rgba)) {
+    if (!DownloadTextureRegion(tex, x, y, w, h, rgba)) {
         free(pixels);
         free(rgba);
         return NULL;
@@ -1083,17 +1402,30 @@ static unsigned char* AllocRgb888Region(int x, int y, int w, int h) {
 }
 
 unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
+    VideoLayout layout = ResolveVideoLayout();
+    int fb_index = layout.native && !display_rgb24 && device
+                       ? FindFbByOrigin(display_area.x, display_area.y)
+                       : -1;
+    if (fb_index >= 0 && PrepareCanvas(&layout, fb_index)) {
+        *w = layout.canvas.w * (int)canvas_res;
+        *h = layout.canvas.h * (int)canvas_res;
+        Draw_FlushBuffer();
+        return AllocRgb888Region(canvas_tex[fb_index], 0, 0, *w, *h);
+    }
+    SyncCanvasesForRead();
     *w = display_size.x;
     *h = display_size.y;
     return display_rgb24
                ? AllocRgb24Region(display_area.x, display_area.y, *w, *h)
-               : AllocRgb888Region(display_area.x, display_area.y, *w, *h);
+               : AllocRgb888Region(
+                     vram_render, display_area.x, display_area.y, *w, *h);
 }
 
 unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
+    SyncCanvasesForRead();
     *w = VRAM_W;
     *h = VRAM_H;
-    return AllocRgb888Region(0, 0, VRAM_W, VRAM_H);
+    return AllocRgb888Region(vram_render, 0, 0, VRAM_W, VRAM_H);
 }
 
 static void UpdateScissor() {
@@ -1120,15 +1452,13 @@ static void UpdateScissor() {
 unsigned Psyz_VideoGetInternalResolution(void) { return internal_res; }
 
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
-    if (multiplier < 1) {
-        return -1;
-    }
     if (multiplier > PSYZ_INTERNAL_RES_MAX) {
         WARNF("internal resolution %dx exceeds maximum value of %dx",
               multiplier, PSYZ_INTERNAL_RES_MAX);
         return -1;
     }
-    set_internal_res = multiplier;
+    internal_res_auto = multiplier == PSYZ_INTERNAL_RES_AUTO;
+    set_internal_res = internal_res_auto ? 1 : multiplier;
     if (sdl3_window && is_platform_init_successful) {
         ApplyPendingInternalRes();
     }
@@ -1231,10 +1561,6 @@ static void ApplyDisplayPendingChanges() {
         Psyz_IosAttachWindow(sdl3_window);
 #endif
     }
-    if (cur_disp_horiz != set_disp_horiz || cur_disp_vert != set_disp_vert) {
-        cur_disp_horiz = set_disp_horiz;
-        cur_disp_vert = set_disp_vert;
-    }
 }
 
 void Draw_Reset() { NOT_IMPLEMENTED; }
@@ -1254,6 +1580,12 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
     display_area.y = (int)y;
 
     Draw_FlushBuffer();
+    bool replaced;
+    int fb_index = AddFbOrigin((int)x, (int)y, &replaced);
+    if (replaced) {
+        SyncCanvasToVram(fb_index);
+        DiscardCanvas(fb_index);
+    }
     if (moved && gutter_px > 0 && gutter_render) {
         // a flip: the buffer drawn next starts with black gutters
         ClearTargetRect(gutter_render, 0, 0, VRAM_W, display_area.y, 0, 0, 0);
@@ -1270,8 +1602,8 @@ void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
 }
 
 void Draw_DisplayVerticalRange(unsigned int start, int unsigned end) {
-    set_disp_vert = (int)(end - start);
-    ApplyDisplayPendingChanges();
+    (void)start;
+    (void)end;
 }
 
 void Draw_SetDisplayMode(DisplayMode* mode) {
@@ -1282,9 +1614,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     if (mode->reversed) {
         WARNF("reverse mode not supported");
     }
-    is_pal = mode->pal;
-    if (mode->horizontal_resolution_368) {
-        display_size.x = 368;
+    if (mode->horizontal_resolution_384) {
+        display_size.x = 384;
     } else {
         switch (mode->horizontal_resolution) {
         case 0:
@@ -1308,6 +1639,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
         previous_size.y != display_size.y) {
         rgb24_dirty = true;
     }
+    fb_size.w = display_size.x;
+    fb_size.h = display_size.y;
     ApplyDisplayPendingChanges();
 
     double new_target_fps = mode->pal ? VSYNC_PAL : VSYNC_NTSC;
@@ -1316,7 +1649,31 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     }
 }
 
-int Draw_ExequeSync() { return 0; }
+int Draw_ExequeSync() {
+    if (!n_readbacks) {
+        return 0;
+    }
+    if (readback_fence) {
+        SDL_WaitForGPUFences(device, true, &readback_fence, 1);
+        SDL_ReleaseGPUFence(device, readback_fence);
+        readback_fence = NULL;
+    }
+    const u8* map =
+        SDL_MapGPUTransferBuffer(device, tex_download_transfer, false);
+    if (map) {
+        for (int i = 0; i < n_readbacks; i++) {
+            const Readback* r = &readbacks[i];
+            ConvertRgba8888ToRgb5551(
+                map + r->offset, (u16*)r->dst, (size_t)r->w * r->h);
+        }
+        SDL_UnmapGPUTransferBuffer(device, tex_download_transfer);
+    } else {
+        ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
+    }
+    n_readbacks = 0;
+    readback_used = 0;
+    return 0;
+}
 
 // optimization to avoid sampling the VRAM on an untextured batch draw
 static bool batch_has_texture = false;
@@ -1332,6 +1689,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     u16 tpage = -1, clut = -1, pad2, pad3;
     Vertex* v;
 
+    if (isTextured && PrimSamplesDirtyFb(packets, max_len, isPoly, isGouraud,
+                                         cur_tpage, PendingBatchRect())) {
+        Draw_FlushBuffer();
+        SyncDirtyCanvases(NULL);
+    }
     // to ensure we always have space, we pretend we want to allocate a quad
     // Gouraud read-ahead can write a colour into a fifth vertex slot.
     Draw_EnsureBufferWillNotOverflow(5, 6);
@@ -1380,12 +1742,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 len++;
             }
 
-            if (isTextured) {
-                FixupFlipUV(vertex_cur, code & EXTRA_VERTEX);
-            } else {
+            if (!isTextured) {
                 clut = -1;
                 tpage = cur_tpage | TPAGE_NOTEXTURE;
             }
+            tpage |= TPAGE_POLYGON;
             if (CanPolyDither(isGouraud, isTextured, isShadeTex)) {
                 tpage |= TPAGE_DITHER;
             }
@@ -1619,12 +1980,6 @@ void Draw_SetOffset(int x, int y) {
 
     x = x % VRAM_W;
     y = y % VRAM_H;
-    if (x < 0) {
-        x += VRAM_W;
-    }
-    if (y < 0) {
-        y += VRAM_H;
-    }
     draw_offset.x = x;
     draw_offset.y = y;
 }
@@ -1632,93 +1987,82 @@ void Draw_SetOffset(int x, int y) {
 // fills a rectangle, in VRAM pixels, of a VRAM-sized (or scaled) target
 static void ClearTargetRect(SDL_GPUTexture* texture, int x, int y, int w,
                             int h, u_char r, u_char g, u_char b) {
-    if (w <= 0 || h <= 0 || !texture) {
+    if (!texture) {
         return;
     }
-    SDL_GPUCommandBuffer* cmd = AcquireCmd();
-    if (!cmd) {
-        return;
-    }
-
-    Vertex quad[4] = {0};
-    quad[0].x = (short)x;
-    quad[0].y = (short)y;
-    quad[1].x = (short)(x + w);
-    quad[1].y = (short)y;
-    quad[2].x = (short)x;
-    quad[2].y = (short)(y + h);
-    quad[3].x = (short)(x + w);
-    quad[3].y = (short)(y + h);
-    for (int i = 0; i < 4; i++) {
-        quad[i].r = r;
-        quad[i].g = g;
-        quad[i].b = b;
-        quad[i].a = 0;
-    }
-
-    Vertex* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, true);
-    if (!map) {
-        ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
-        return;
-    }
-    memcpy(map, quad, sizeof(quad));
-    SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
-
-    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
-    const SDL_GPUTransferBufferLocation src = {.transfer_buffer = vtx_transfer};
-    const SDL_GPUBufferRegion dst = {
-        .buffer = clear_vbuf, .size = sizeof(quad)};
-    SDL_UploadToGPUBuffer(copy, &src, &dst, true);
-    SDL_EndGPUCopyPass(copy);
-
-    const SDL_GPUColorTargetInfo target = {
-        .texture = texture,
-        .load_op = SDL_GPU_LOADOP_LOAD,
-        .store_op = SDL_GPU_STOREOP_STORE,
-    };
-    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
-    SDL_BindGPUGraphicsPipeline(pass, pipe_clear);
-    const SDL_GPUBufferBinding vb = {.buffer = clear_vbuf};
-    SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
-    SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
-    SDL_EndGPURenderPass(pass);
+    FillRect(texture, (PsyzSize){VRAM_W, VRAM_H}, (SDL_Rect){x, y, w, h}, r, g,
+             b);
 }
 
 void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (rect->w == 0 || rect->h == 0) {
         return;
     }
+    r = To15BitChannel(r);
+    g = To15BitChannel(g);
+    b = To15BitChannel(b);
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
-    ClearTargetRect(vram_render, rect->x, rect->y, rect->w, rect->h, r, g, b);
+    const VideoLayout layout = ResolveVideoLayout();
+    const SDL_Rect area = {rect->x, rect->y, rect->w, rect->h};
+    if (!layout.native) {
+        LeaveNative();
+    }
+    FillRect(vram_render, (PsyzSize){VRAM_W, VRAM_H}, area, r, g, b);
     // a clear of the whole display also clears its gutters
     if (gutter_px > 0 && rect->x == display_area.x &&
         rect->w == display_size.x) {
-        SDL_GPUTexture* gutters = GetGutterTarget();
-        ClearTargetRect(gutters, 0, rect->y,
+        ClearTargetRect(GetGutterTarget(), 0, rect->y,
                         display_size.x + 2 * (int)gutter_px, rect->h, r, g, b);
     }
-    MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
+    MarkVramDirty(area);
     SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    for (int i = 0; layout.native && i < fb_origin_count; i++) {
+        SDL_Rect fb = GetFbRect(i);
+        if (SDL_HasRectIntersection(&area, &fb) && PrepareCanvas(&layout, i)) {
+            FillRect(canvas_tex[i], canvas_size,
+                     MapVramToCanvas(&layout, i, area, 1), r, g, b);
+        }
+    }
+}
+
+// uploads the part of the image in tex_upload_transfer that falls in clip
+static void UploadVramPart(const PS1_RECT* rect, SDL_Rect clip) {
+    const SDL_Rect area = {rect->x, rect->y, rect->w, rect->h};
+    SDL_Rect part;
+    if (!SDL_GetRectIntersection(&area, &clip, &part)) {
+        return;
+    }
+    UploadImage(vram_render, part.x, part.y, rect->w, part.x - rect->x,
+                part.y - rect->y, part.w, part.h);
+    MarkVramDirty(part);
+    SyncNativeVramToScaled(part.x, part.y, part.w, part.h);
 }
 
 void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
-    if (rect->w == 0 || rect->h == 0) {
+    if (rect->w <= 0 || rect->h <= 0) {
         return;
     }
-    if (rect->x < 0 || rect->y < 0 || rect->w < 0 || rect->h < 0 ||
-        rect->x + rect->w > VRAM_W || rect->y + rect->h > VRAM_H) {
-        WARNF("rect (%d,%d %dx%d) is out of bound %dx%d, skipping upload",
-              rect->x, rect->y, rect->w, rect->h, VRAM_W, VRAM_H);
+    if (rect->w * rect->h > VRAM_W * VRAM_H) {
+        WARNF("rect (%d,%d %dx%d) is too large, skipping upload", rect->x,
+              rect->y, rect->w, rect->h);
         return;
     }
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
-    SDL_GPUCommandBuffer* cmd = AcquireCmd();
-    if (!cmd) {
-        return;
+    const VideoLayout layout = ResolveVideoLayout();
+    const SDL_Rect area = {rect->x, rect->y, rect->w, rect->h};
+    const SDL_Rect vram = {0, 0, VRAM_W, VRAM_H};
+    SDL_Rect clamped;
+    if (!layout.native) {
+        LeaveNative();
+        if (!SDL_GetRectIntersection(&area, &vram, &clamped) ||
+            !SDL_RectsEqual(&area, &clamped)) {
+            WARNF("rect (%d,%d %dx%d) is out of bound %dx%d, clamping upload",
+                  rect->x, rect->y, rect->w, rect->h, VRAM_W, VRAM_H);
+        }
     }
     u8* map = SDL_MapGPUTransferBuffer(device, tex_upload_transfer, true);
     if (!map) {
@@ -1728,24 +2072,26 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
     ConvertRgb5551ToRgba8888((const u16*)p, map, (size_t)rect->w * rect->h);
     SDL_UnmapGPUTransferBuffer(device, tex_upload_transfer);
 
-    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
-    const SDL_GPUTextureTransferInfo src = {
-        .transfer_buffer = tex_upload_transfer,
-        .pixels_per_row = rect->w,
-        .rows_per_layer = rect->h,
-    };
-    const SDL_GPUTextureRegion dst = {
-        .texture = vram_render,
-        .x = (Uint32)rect->x,
-        .y = (Uint32)rect->y,
-        .w = rect->w,
-        .h = rect->h,
-        .d = 1,
-    };
-    SDL_UploadToGPUTexture(copy, &src, &dst, false);
-    SDL_EndGPUCopyPass(copy);
-    MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
-    SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    // an image touching the framebuffer being drawn only writes VRAM inside
+    // it and its canvas gets all of it, so the overhang keeps nearby VRAM
+    int fb_index =
+        layout.native ? FindFbContaining(scissor_rect.x, scissor_rect.y) : -1;
+    SDL_Rect fb = fb_index >= 0 ? GetFbRect(fb_index) : vram;
+    if (fb_index >= 0 && SDL_HasRectIntersection(&area, &fb)) {
+        UploadVramPart(rect, fb);
+        if (PrepareCanvas(&layout, fb_index)) {
+            CanvasUploadImage(&layout, fb_index, rect);
+        }
+        SubmitCmd();
+        return;
+    }
+    UploadVramPart(rect, vram);
+    for (int i = 0; layout.native && i < fb_origin_count; i++) {
+        fb = GetFbRect(i);
+        if (SDL_HasRectIntersection(&area, &fb) && PrepareCanvas(&layout, i)) {
+            CanvasUploadImage(&layout, i, rect);
+        }
+    }
     /* Movie DecDCToutCallback chains LoadImage recursively; the upload
      * transfer buffer cannot be remapped until this command buffer is
      * submitted. */
@@ -1765,18 +2111,44 @@ void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
     if (!device || !vram_render) {
         return;
     }
+    const Uint32 bytes = (Uint32)rect->w * (Uint32)rect->h * 4;
+    if (n_readbacks == MAX_PENDING_STORES ||
+        readback_used + bytes > VRAM_BYTES) {
+        Draw_ExequeSync();
+    }
     Draw_FlushBuffer(); // flush primitives before operating with the VRAM
-
-    const size_t pixels = (size_t)rect->w * rect->h;
-    u8* rgba = malloc(pixels * 4);
-    if (!rgba) {
+    SyncDirtyCanvases(&(SDL_Rect){rect->x, rect->y, rect->w, rect->h});
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (!cmd) {
         return;
     }
-    if (DownloadVramRegionAsRGBA8888(
-            rect->x, rect->y, rect->w, rect->h, rgba)) {
-        ConvertRgba8888ToRgb5551(rgba, (u16*)p, pixels);
+    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+    const SDL_GPUTextureRegion region = {
+        .texture = vram_render,
+        .x = (Uint32)rect->x,
+        .y = (Uint32)rect->y,
+        .w = (Uint32)rect->w,
+        .h = (Uint32)rect->h,
+        .d = 1,
+    };
+    const SDL_GPUTextureTransferInfo transfer = {
+        .transfer_buffer = tex_download_transfer,
+        .offset = readback_used,
+        .pixels_per_row = (Uint32)rect->w,
+        .rows_per_layer = (Uint32)rect->h,
+    };
+    SDL_DownloadFromGPUTexture(copy, &region, &transfer);
+    SDL_EndGPUCopyPass(copy);
+    // submit now so the GPU copies while the CPU runs the game logic
+    if (readback_fence) {
+        SDL_ReleaseGPUFence(device, readback_fence);
     }
-    free(rgba);
+    readback_fence = SDL_SubmitGPUCommandBufferAndAcquireFence(pending_cmd);
+    pending_cmd = NULL;
+    readbacks[n_readbacks++] = (Readback){
+        .offset = readback_used, .w = rect->w, .h = rect->h, .dst = p};
+    readback_used =
+        (readback_used + bytes + READBACK_ALIGN - 1) & ~(READBACK_ALIGN - 1);
 }
 
 void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
@@ -1806,6 +2178,12 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     if (copy_w <= 0 || copy_h <= 0) {
         WARNF("nothing to copy");
         return;
+    }
+    const VideoLayout layout = ResolveVideoLayout();
+    if (layout.native) {
+        SyncDirtyCanvases(&(SDL_Rect){src_x, src_y, copy_w, copy_h});
+    } else {
+        LeaveNative();
     }
 
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
@@ -1839,8 +2217,15 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         }
     }
     SDL_EndGPUCopyPass(copy);
-    MarkVramDirty((SDL_Rect){dst_x, dst_y, copy_w, copy_h});
+    const SDL_Rect dst = {dst_x, dst_y, copy_w, copy_h};
+    MarkVramDirty(dst);
     SyncNativeVramToScaled(dst_x, dst_y, copy_w, copy_h);
+    for (int i = 0; layout.native && i < fb_origin_count; i++) {
+        SDL_Rect fb = GetFbRect(i);
+        if (SDL_HasRectIntersection(&dst, &fb) && PrepareCanvas(&layout, i)) {
+            CopyVramToCanvas(i, dst);
+        }
+    }
 }
 
 void Draw_ResetBuffer(void) {
@@ -1852,7 +2237,7 @@ void Draw_ResetBuffer(void) {
 }
 
 static void DrawBatch(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* texture,
-                      SDL_Rect scissor, int offset_x);
+                      SDL_Rect scissor, Posi offset, PsyzSize target_size);
 
 void Draw_FlushBuffer(void) {
     if (n_vertices == 0) {
@@ -1864,6 +2249,27 @@ void Draw_FlushBuffer(void) {
         // Do not fall back to the last non-empty scissor.
         Draw_ResetBuffer();
         return;
+    }
+    // the area is the one of the batch: Draw_SetAreaEnd flushes before
+    // updating scissor_rect
+    const VideoLayout layout = ResolveVideoLayout();
+    int fb_index =
+        layout.native ? FindFbContaining(scissor_rect.x, scissor_rect.y) : -1;
+    SDL_Rect canvas_rect = {0, 0, 0, 0};
+    Posi offset = draw_offset;
+    if (fb_index >= 0 && PrepareCanvas(&layout, fb_index)) {
+        canvas_rect = MapVramToCanvas(&layout, fb_index, scissor_rect, 1);
+        if (canvas_rect.w <= 0 || canvas_rect.h <= 0) {
+            Draw_ResetBuffer();
+            return;
+        }
+        offset.x += canvas_shift[fb_index].x;
+        offset.y += canvas_shift[fb_index].y;
+    } else if (layout.native) {
+        fb_index = -1;
+        SyncDirtyCanvases(&scissor_rect);
+    } else {
+        LeaveNative();
     }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
@@ -1905,50 +2311,58 @@ void Draw_FlushBuffer(void) {
     }
     SDL_EndGPUCopyPass(copy);
 
-    DrawBatch(cmd, GetRenderTarget(), scissor_rect, draw_offset.x);
-    if (GutterActive()) {
-        // again into the gutter target, shifted so the display starts at
-        // gutter_px and clipped to the display plus both gutters
-        SDL_GPUTexture* gutters = GetGutterTarget();
-        if (gutters) {
-            const SDL_Rect wide = {
-                0, scissor_rect.y, display_size.x + 2 * (int)gutter_px,
-                scissor_rect.h};
-            DrawBatch(cmd, gutters, wide,
-                      draw_offset.x + (int)gutter_px - draw_area_start.x);
+    if (fb_index >= 0) {
+        DrawBatch(cmd, canvas_tex[fb_index], canvas_rect, offset, canvas_size);
+        InvalidateCanvas(&layout, fb_index, scissor_rect);
+    } else {
+        const PsyzSize vram_size = {VRAM_W, VRAM_H};
+        DrawBatch(cmd, GetRenderTarget(), scissor_rect, draw_offset, vram_size);
+        if (GutterActive()) {
+            // again into the gutter target, shifted so the display starts at
+            // gutter_px and clipped to the display plus both gutters
+            SDL_GPUTexture* gutters = GetGutterTarget();
+            if (gutters) {
+                const SDL_Rect wide = {
+                    0, scissor_rect.y, display_size.x + 2 * (int)gutter_px,
+                    scissor_rect.h};
+                const Posi gutter_offset = {
+                    draw_offset.x + (int)gutter_px - draw_area_start.x,
+                    draw_offset.y};
+                DrawBatch(cmd, gutters, wide, gutter_offset, vram_size);
+            }
         }
+        if (internal_res <= 1) {
+            MarkVramDirty(scissor_rect);
+        }
+        SyncScaledVramToNative();
     }
-    if (internal_res <= 1) {
-        MarkVramDirty(scissor_rect);
-    }
-    SyncScaledVramToNative();
     Draw_ResetBuffer();
 }
 
+// Draws the queued batch into `texture` (a scale-internal_res image of
+// target_size game pixels) within `scissor`, the primitives shifted by offset
 static void DrawBatch(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* texture,
-                      SDL_Rect scissor, int offset_x) {
+                      SDL_Rect scissor, Posi offset, PsyzSize target_size) {
     const SDL_GPUColorTargetInfo target = {
         .texture = texture,
         .load_op = SDL_GPU_LOADOP_LOAD,
         .store_op = SDL_GPU_STOREOP_STORE,
     };
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
+    const float grid_scale_x = GetDrawGridXScale();
+    const float render_scale = (float)internal_res;
     {
-        const float grid_scale_x = GetDrawGridXScale();
-        const float render_scale = (float)internal_res;
         const SDL_GPUViewport grid_viewport = {
-            .x = (float)offset_x * render_scale * (1.0f - grid_scale_x),
+            .x = (float)offset.x * render_scale * (1.0f - grid_scale_x),
             .y = 0.0f,
-            .w = (float)VRAM_W * render_scale * grid_scale_x,
-            .h = (float)VRAM_H * render_scale,
+            .w = (float)target_size.w * render_scale * grid_scale_x,
+            .h = (float)target_size.h * render_scale,
             .min_depth = 0.0f,
             .max_depth = 1.0f,
         };
         SDL_SetGPUViewport(pass, &grid_viewport);
     }
-    SDL_Rect scaled_scissor = {
-        scissor.x * (int)internal_res, scissor.y * (int)internal_res,
-        scissor.w * (int)internal_res, scissor.h * (int)internal_res};
+    SDL_Rect scaled_scissor = ScaleRect(scissor, (int)internal_res);
     SDL_SetGPUScissor(pass, &scaled_scissor);
     const SDL_GPUBufferBinding vb = {.buffer = vbuf};
     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
@@ -1957,7 +2371,13 @@ static void DrawBatch(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* texture,
     const SDL_GPUTextureSamplerBinding sampler_binding = {
         .texture = vram_sample, .sampler = vram_sampler};
     SDL_BindGPUFragmentSamplers(pass, 0, &sampler_binding, 1);
-    const float offset_ubo[4] = {(float)offset_x, (float)draw_offset.y, 0, 0};
+    const float offset_ubo[6] = {
+        (float)offset.x,
+        (float)offset.y,
+        0.5f / (render_scale * grid_scale_x),
+        0.5f / render_scale,
+        (float)target_size.w,
+        (float)target_size.h};
     SDL_PushGPUVertexUniformData(cmd, 0, offset_ubo, sizeof(offset_ubo));
 
     // every primitive (including lines, expanded to quads) is a triangle list

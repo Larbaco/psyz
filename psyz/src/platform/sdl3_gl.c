@@ -48,7 +48,7 @@ static const char vertex_shader_body[] = {
     "layout(location = 2) in vec4 color;\n"
     "layout(location = 3) in vec4 twin;\n"
     "uniform vec2 resolution;\n"
-    "uniform vec2 drawOffset;\n"
+    "uniform vec2 drawOffset, halfPixel, targetSize;\n"
     "out vec4 vertexColor;\n"
     "out vec2 rawUV;\n"
     "flat out uint tpage;\n"
@@ -64,8 +64,13 @@ static const char vertex_shader_body[] = {
     "flat out uvec4 texWindow;\n"   // GP0(E2h) as {and.xy, or.zw}
     "\n"
     "void main() {\n"
-    "    float x = ((pos.x + drawOffset.x) / (1024.0 / 2.0)) - 1.0;\n"
-    "    float y = ((pos.y + drawOffset.y) / (512.0 / 2.0)) - 1.0;\n"
+    // polygons move their PS1 integer coords onto the pixel centres, while
+    // 1:1 sprites keep their position and step their UVs back instead
+    "    vec2 shift = (uint(tex.w) & 0x2000u) != 0u ? halfPixel : vec2(0.0);\n"
+    "    float x = ((pos.x + drawOffset.x + shift.x) / (targetSize.x / 2.0)) - "
+    "1.0;\n"
+    "    float y = ((pos.y + drawOffset.y + shift.y) / (targetSize.y / 2.0)) - "
+    "1.0;\n"
     "    gl_Position = vec4(x, y, 0.0, 1.0);\n"
     // gouraud colors
     "    vertexColor = color;\n"
@@ -74,7 +79,7 @@ static const char vertex_shader_body[] = {
     "    uint texWord = uint(tex.w);\n"
     "    tpage = texWord & 0x1FFu;\n"
     "    dither = (texWord & 0x4000u) != 0u ? 1u : 0u;\n"
-    "    rawUV = tex.xy;\n"
+    "    rawUV = tex.xy + shift - halfPixel;\n"
     // Determine texture mode and pre-compute parameters
     "    subPixelMask = 0u;\n"
     "    texelShift = 0u;\n"
@@ -122,8 +127,7 @@ static const char fragment_shader_body[] = {
     "uniform sampler2D texVram;\n"
     "\n"
     "uvec2 resolveTexel() {\n"
-    "    vec2 texelStep = vec2(abs(dFdx(rawUV.x)), abs(dFdy(rawUV.y)));\n"
-    "    vec2 uv = rawUV - 0.5 * texelStep + 1.0 / 512.0;\n"
+    "    vec2 uv = rawUV + 1.0 / 512.0;\n"
     "    uvec2 texel = uvec2(clamp(floor(uv), vec2(0.0), vec2(255.0)));\n"
     "    return (texel & texWindow.xy) | texWindow.zw;\n"
     "}\n"
@@ -180,8 +184,10 @@ static const char fragment_shader_body[] = {
     // PS1-accurate texture-color modulation: (tex5 * col8) >> 7
     "    vec3 modColor;\n"
     "    if (textureMode == 0u) {\n"
-    // untextured: PS1 uses color directly, no modulation
-    "        modColor = texColor.rgb * vertexColor.rgb;\n"
+    // untextured: PS1 uses color directly, truncated to 15-bit
+    "        vec3 col8 = floor(vertexColor.rgb * 255.0 + 0.5);\n"
+    "        modColor = dither != 0u ? col8 / 255.0\n"
+    "                                : floor(col8 / 8.0) / 31.0;\n"
     "    } else {\n"
     "        vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);\n"
     "        vec3 col8 = min(floor(vertexColor.rgb * 127.5 + 0.5), "
@@ -226,10 +232,24 @@ static GLuint shader_program = 0;
 static GLint uniform_resolution = 0;
 static GLint uniform_tex_vram = 0;
 static GLint uniform_draw_offset = 0;
+static GLint uniform_half_pixel = 0;
+static GLint uniform_target_size = 0;
 static GLuint vram_texture;
 static GLuint vram_fbo = 0;
 static GLuint scratch_texture = 0;
 static GLuint scratch_fbo = 0;
+
+#define READBACK_BYTES (VRAM_W * VRAM_H * 4)
+typedef struct {
+    size_t offset;
+    int w, h;
+    u_long* dst;
+} Readback;
+static GLuint readback_pbo = 0;
+static GLsync readback_fence = 0;
+static Readback readbacks[MAX_PENDING_STORES];
+static int n_readbacks = 0;
+static size_t readback_used = 0;
 static GLuint scaled_vram_texture = 0;
 static GLuint scaled_vram_fbo = 0; // it's vram_fbo * internal_res
 static unsigned internal_res = 1;
@@ -330,7 +350,7 @@ static void ResolveGlProfile(void) {
     glVer_required_minor = use_gles ? 0 : 3;
 }
 
-bool InitPlatform() {
+bool InitPlatform(void) {
     if (is_platform_initialized) {
         return is_platform_init_successful;
     }
@@ -414,9 +434,12 @@ bool InitPlatform() {
     uniform_resolution = glGetUniformLocation(shader_program, "resolution");
     uniform_tex_vram = glGetUniformLocation(shader_program, "texVram");
     uniform_draw_offset = glGetUniformLocation(shader_program, "drawOffset");
+    uniform_half_pixel = glGetUniformLocation(shader_program, "halfPixel");
+    uniform_target_size = glGetUniformLocation(shader_program, "targetSize");
 
     glUniform1i(uniform_tex_vram, 0);
     glUniform2f(uniform_draw_offset, 0, 0);
+    glUniform2f(uniform_target_size, (float)VRAM_W, (float)VRAM_H);
     glGenTextures(1, &vram_texture);
 
     glActiveTexture(GL_TEXTURE0);
@@ -456,6 +479,7 @@ bool InitPlatform() {
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
+    Sdl3Common_VideoInit();
     if (overlay_init_cb) {
         overlay_init_cb(sdl3_window, glContext);
     }
@@ -515,6 +539,16 @@ static void SyncScaledVramToNative(void) {
 }
 
 static bool CreateScaledVramFbo(int n) {
+    if (readback_fence) {
+        glDeleteSync(readback_fence);
+        readback_fence = 0;
+    }
+    if (readback_pbo) {
+        glDeleteBuffers(1, &readback_pbo);
+        readback_pbo = 0;
+    }
+    n_readbacks = 0;
+    readback_used = 0;
     if (scaled_vram_texture) {
         glDeleteTextures(1, &scaled_vram_texture);
         scaled_vram_texture = 0;
@@ -567,10 +601,14 @@ static unsigned AdjustInternalRes(unsigned scale) {
 }
 
 static void ApplyPendingInternalRes(void) {
-    if (set_internal_res == internal_res) {
+    if (!sdl3_window || !is_platform_init_successful) {
         return;
     }
-    if (!sdl3_window || !is_platform_init_successful) {
+    if (internal_res_auto) {
+        VideoLayout layout = ResolveVideoLayout();
+        set_internal_res = GetAutoInternalRes(&layout);
+    }
+    if (set_internal_res == internal_res) {
         return;
     }
     unsigned n = AdjustInternalRes(set_internal_res);
@@ -585,6 +623,7 @@ static void ApplyPendingInternalRes(void) {
     if (need_separate_target && !CreateScaledVramFbo(n)) {
         n = 1;
         set_internal_res = 1;
+        internal_res_auto = false;
     }
     if (need_separate_target && HasSeparateDrawTarget()) {
         // scale native VRAM to scaled VRAM according to internal resolution
@@ -604,6 +643,222 @@ static void ApplyPendingInternalRes(void) {
     BindDrawFbo();
     UpdateScissor();
     INFOF("internal resolution set to %dx (%dx%d)", n, VRAM_W * n, VRAM_H * n);
+}
+
+static bool EnsureScratchFbo(void);
+
+static SDL_Rect ScaleRect(SDL_Rect r, int n) {
+    return (SDL_Rect){r.x * n, r.y * n, r.w * n, r.h * n};
+}
+
+static void RestoreDrawTarget(void) {
+    const SDL_Rect s = ScaleRect(scissor_rect, (int)internal_res);
+    BindDrawFbo();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, vram_texture);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(s.x, s.y, s.w, s.h);
+}
+
+static void Blit(GLuint src, SDL_Rect s, GLuint dst, SDL_Rect d) {
+    if (s.w <= 0 || s.h <= 0 || d.w <= 0 || d.h <= 0) {
+        return;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glBlitFramebuffer(s.x, s.y, s.x + s.w, s.y + s.h, d.x, d.y, d.x + d.w,
+                      d.y + d.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    RestoreDrawTarget();
+}
+
+static void FillRect(GLuint fbo, SDL_Rect area, u8 r, u8 g, u8 b) {
+    if (area.w <= 0 || area.h <= 0) {
+        return;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(area.x, area.y, area.w, area.h);
+    glClearColor((float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    RestoreDrawTarget();
+}
+
+static void UploadImage(GLuint tex, int x, int y, const u8* buf, int pitch,
+                        int sx, int sy, int w, int h) {
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, pitch);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, sx);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, sy);
+    glTexSubImage2D(
+        GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    glBindTexture(GL_TEXTURE_2D, vram_texture);
+}
+
+static GLuint canvas_tex[FB_COUNT];
+static GLuint canvas_fbo[FB_COUNT];
+static unsigned canvas_res;  // internal resolution of canvas_tex, 0 for none
+static PsyzSize canvas_size; // native resolution of canvas_tex, in game pixels
+
+static void CopyVramToCanvas(int fb_index, SDL_Rect vram) {
+    const FbOrigin s = canvas_shift[fb_index];
+    const SDL_Rect fb = GetFbRect(fb_index);
+    const SDL_Rect tex = {-s.x, -s.y, canvas_size.w, canvas_size.h};
+    if (!SDL_GetRectIntersection(&vram, &fb, &vram) ||
+        !SDL_GetRectIntersection(&vram, &tex, &vram)) {
+        return;
+    }
+    const SDL_Rect dst = {vram.x + s.x, vram.y + s.y, vram.w, vram.h};
+    Blit(GetDrawFbo(), ScaleRect(vram, (int)internal_res), canvas_fbo[fb_index],
+         ScaleRect(dst, (int)canvas_res));
+}
+
+static void SyncCanvasToVram(int fb_index) {
+    const SDL_Rect r = canvas_dirty[fb_index];
+    const FbOrigin s = canvas_shift[fb_index];
+    if (r.w <= 0 || r.h <= 0 || !canvas_fbo[fb_index]) {
+        return;
+    }
+    const SDL_Rect c =
+        ScaleRect((SDL_Rect){r.x + s.x, r.y + s.y, r.w, r.h}, (int)canvas_res);
+    Blit(canvas_fbo[fb_index], c, vram_fbo, r);
+    if (HasSeparateDrawTarget()) {
+        Blit(canvas_fbo[fb_index], c, scaled_vram_fbo,
+             ScaleRect(r, (int)internal_res));
+    }
+    MarkRgb24Dirty(r.x, r.y, r.w, r.h);
+    canvas_dirty[fb_index] = (SDL_Rect){0, 0, 0, 0};
+}
+
+static void SyncDirtyCanvases(const SDL_Rect* region) {
+    for (int i = 0; i < fb_origin_count; i++) {
+        if (!region || SDL_HasRectIntersection(region, &canvas_dirty[i])) {
+            SyncCanvasToVram(i);
+        }
+    }
+}
+
+// VRAM becomes the only copy of the framebuffers outside of native mode
+static void LeaveNative(void) {
+    for (int i = 0; i < fb_origin_count; i++) {
+        SyncCanvasToVram(i);
+        DiscardCanvas(i);
+    }
+}
+
+static void ReleaseCanvases(void) {
+    for (int i = 0; i < FB_COUNT; i++) {
+        if (canvas_fbo[i]) {
+            glDeleteFramebuffers(1, &canvas_fbo[i]);
+            canvas_fbo[i] = 0;
+        }
+        if (canvas_tex[i]) {
+            glDeleteTextures(1, &canvas_tex[i]);
+            canvas_tex[i] = 0;
+        }
+        DiscardCanvas(i);
+    }
+    canvas_res = 0;
+    canvas_size = (PsyzSize){0, 0};
+}
+
+static bool EnsureCanvases(const VideoLayout* l) {
+    if (canvas_fbo[0] && canvas_res == internal_res &&
+        canvas_size.w == l->canvas.w && canvas_size.h == l->canvas.h) {
+        return true;
+    }
+    SyncDirtyCanvases(NULL);
+    ReleaseCanvases();
+    bool ok = true;
+    for (int i = 0; ok && i < FB_COUNT; i++) {
+        glGenTextures(1, &canvas_tex[i]);
+        glBindTexture(GL_TEXTURE_2D, canvas_tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_RGBA8, l->canvas.w * internal_res,
+            l->canvas.h * internal_res, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glGenFramebuffers(1, &canvas_fbo[i]);
+        glBindFramebuffer(GL_FRAMEBUFFER, canvas_fbo[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, canvas_tex[i], 0);
+        ok =
+            glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    }
+    RestoreDrawTarget();
+    if (!ok) {
+        ERRORF("canvas FBO creation failed (%dx)", internal_res);
+        ReleaseCanvases();
+        return false;
+    }
+    canvas_res = internal_res;
+    canvas_size = l->canvas;
+    return true;
+}
+
+static bool PrepareCanvas(const VideoLayout* l, int fb_index) {
+    if (!EnsureCanvases(l)) {
+        return false;
+    }
+    if (!IsCanvasLayoutCurrent(l, fb_index)) {
+        SyncCanvasToVram(fb_index);
+        FillRect(canvas_fbo[fb_index],
+                 ScaleRect((SDL_Rect){0, 0, canvas_size.w, canvas_size.h},
+                           (int)canvas_res),
+                 0, 0, 0);
+        canvas_dirty[fb_index] = (SDL_Rect){0, 0, 0, 0};
+        canvas_shift[fb_index] = GetCanvasShift(l, fb_index);
+        CopyVramToCanvas(fb_index, GetFbRect(fb_index));
+    }
+    return true;
+}
+
+// places the RGBA8888 image on the canvas, past the VRAM edges
+static void CanvasUploadImage(
+    const VideoLayout* l, int fb_index, const PS1_RECT* rect, const u8* buf) {
+    const FbOrigin s = canvas_shift[fb_index];
+    const SDL_Rect img = {rect->x + s.x, rect->y + s.y, rect->w, rect->h};
+    const SDL_Rect canvas = {0, 0, l->canvas.w, l->canvas.h};
+    SDL_Rect dst;
+    if (!SDL_GetRectIntersection(&img, &canvas, &dst)) {
+        return;
+    }
+    if (canvas_res == 1) {
+        UploadImage(canvas_tex[fb_index], dst.x, dst.y, buf, rect->w,
+                    dst.x - img.x, dst.y - img.y, dst.w, dst.h);
+        return;
+    }
+    // uploads can't scale: stage in the scratch texture and blit it
+    if (!EnsureScratchFbo()) {
+        return;
+    }
+    UploadImage(scratch_texture, 0, 0, buf, rect->w, dst.x - img.x,
+                dst.y - img.y, dst.w, dst.h);
+    Blit(scratch_fbo, (SDL_Rect){0, 0, dst.w, dst.h}, canvas_fbo[fb_index],
+         ScaleRect(dst, (int)canvas_res));
+}
+
+// the area the open batch draws on; a prim sampling it must see that batch
+static SDL_Rect PendingBatchRect(void) {
+    if (n_vertices == 0) {
+        return (SDL_Rect){0, 0, 0, 0};
+    }
+    return scissor_rect;
+}
+
+// makes VRAM up to date for readers outside of the draw path
+static void SyncCanvasesForRead(void) {
+    if (res_request.w != 0) {
+        Draw_FlushBuffer();
+        SyncDirtyCanvases(NULL);
+    } else {
+        LeaveNative();
+    }
 }
 
 static bool PrepareRgb24(void) {
@@ -637,6 +892,18 @@ static void PlatformBackend_Present(void) {
     }
     ApplyPendingInternalRes();
 
+    VideoLayout layout = ResolveVideoLayout();
+    const bool native_present =
+        layout.native && !display_rgb24 && !debug_show_vram && disp_on;
+    int fb_index = -1;
+    if (native_present) {
+        fb_index = FindFbByOrigin(display_area.x, display_area.y);
+        if (fb_index >= 0 && !PrepareCanvas(&layout, fb_index)) {
+            fb_index = -1;
+        }
+    } else {
+        SyncCanvasesForRead();
+    }
     bool use_rgb24 =
         display_rgb24 && !debug_show_vram && disp_on && PrepareRgb24();
     const int n = use_rgb24 ? 1 : (int)internal_res;
@@ -666,7 +933,16 @@ static void PlatformBackend_Present(void) {
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (disp_on) {
+    if (native_present) {
+        if (fb_index >= 0) {
+            const SDL_Rect p = GetCanvasPresentRect(&layout, win.w, win.h);
+            const int cw = layout.canvas.w * (int)canvas_res;
+            const int ch = layout.canvas.h * (int)canvas_res;
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, canvas_fbo[fb_index]);
+            glBlitFramebuffer(0, ch, cw, 0, p.x, win.h - p.y - p.h, p.x + p.w,
+                              win.h - p.y, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    } else if (disp_on) {
         glBlitFramebuffer(src.x * n, (src.y + src.h) * n, (src.x + src.w) * n,
                           src.y * n, dst.x, dst.y, dst.x + dst.w, dst.y + dst.h,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -733,6 +1009,7 @@ void ResetPlatform(void) {
         glDeleteFramebuffers(1, &scaled_vram_fbo);
         scaled_vram_fbo = 0;
     }
+    ReleaseCanvases();
     internal_res = 1;
     glDeleteTextures(1, &rgb24_texture);
     rgb24_texture = 0;
@@ -745,7 +1022,8 @@ void ResetPlatform(void) {
     QuitPlatform();
 }
 
-static unsigned char* AllocRgb888Region(int x, int y, int w, int h) {
+static unsigned char* AllocRgb888Region(
+    GLuint fbo, int x, int y, int w, int h) {
     if (vram_fbo == 0) {
         ERRORF("FBO not initialized");
         return NULL;
@@ -759,7 +1037,7 @@ static unsigned char* AllocRgb888Region(int x, int y, int w, int h) {
     while (glGetError() != GL_NO_ERROR) {
     }
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
 
     size_t count = (size_t)w * h;
     u8* rgba = GetVramConvertBuffer(count * 4);
@@ -786,17 +1064,30 @@ static unsigned char* AllocRgb888Region(int x, int y, int w, int h) {
 }
 
 unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h) {
+    VideoLayout layout = ResolveVideoLayout();
+    int fb_index = layout.native && !display_rgb24 && vram_fbo
+                       ? FindFbByOrigin(display_area.x, display_area.y)
+                       : -1;
+    if (fb_index >= 0 && PrepareCanvas(&layout, fb_index)) {
+        *w = layout.canvas.w * (int)canvas_res;
+        *h = layout.canvas.h * (int)canvas_res;
+        Draw_FlushBuffer();
+        return AllocRgb888Region(canvas_fbo[fb_index], 0, 0, *w, *h);
+    }
+    SyncCanvasesForRead();
     *w = display_size.x;
     *h = display_size.y;
     return display_rgb24
                ? AllocRgb24Region(display_area.x, display_area.y, *w, *h)
-               : AllocRgb888Region(display_area.x, display_area.y, *w, *h);
+               : AllocRgb888Region(
+                     vram_fbo, display_area.x, display_area.y, *w, *h);
 }
 
 unsigned char* Psyz_VideoAllocVramDump(int* w, int* h) {
+    SyncCanvasesForRead();
     *w = VRAM_W;
     *h = VRAM_H;
-    return AllocRgb888Region(0, 0, VRAM_W, VRAM_H);
+    return AllocRgb888Region(vram_fbo, 0, 0, VRAM_W, VRAM_H);
 }
 
 unsigned Psyz_VideoGetInternalResolution(void) { return internal_res; }
@@ -812,15 +1103,13 @@ int Psyz_VideoCopyGutters(int src_y, int h, int dx, int dy) {
 }
 
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
-    if (multiplier < 1) {
-        return -1;
-    }
     if (multiplier > PSYZ_INTERNAL_RES_MAX) {
         WARNF("internal resolution %dx exceeds maximum value of %dx",
               multiplier, PSYZ_INTERNAL_RES_MAX);
         return -1;
     }
-    set_internal_res = multiplier;
+    internal_res_auto = multiplier == PSYZ_INTERNAL_RES_AUTO;
+    set_internal_res = internal_res_auto ? 1 : multiplier;
     if (sdl3_window && is_platform_init_successful) {
         ApplyPendingInternalRes();
     }
@@ -876,10 +1165,6 @@ static void ApplyDisplayPendingChanges() {
         SDL_GL_SwapWindow(sdl3_window);
 #endif
     }
-    if (cur_disp_horiz != set_disp_horiz || cur_disp_vert != set_disp_vert) {
-        cur_disp_horiz = set_disp_horiz;
-        cur_disp_vert = set_disp_vert;
-    }
 }
 
 void Draw_Reset() { NOT_IMPLEMENTED; }
@@ -898,6 +1183,12 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
     display_area.y = (GLint)y;
 
     Draw_FlushBuffer();
+    bool replaced;
+    int fb_index = AddFbOrigin((int)x, (int)y, &replaced);
+    if (replaced) {
+        SyncCanvasToVram(fb_index);
+        DiscardCanvas(fb_index);
+    }
     ApplyDisplayPendingChanges();
     BindDrawFbo();
 }
@@ -908,8 +1199,8 @@ void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
 }
 
 void Draw_DisplayVerticalRange(unsigned int start, int unsigned end) {
-    set_disp_vert = (int)(end - start);
-    ApplyDisplayPendingChanges();
+    (void)start;
+    (void)end;
 }
 
 void Draw_SetDisplayMode(DisplayMode* mode) {
@@ -920,9 +1211,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     if (mode->reversed) {
         WARNF("reverse mode not supported");
     }
-    is_pal = mode->pal;
-    if (mode->horizontal_resolution_368) {
-        display_size.x = 368;
+    if (mode->horizontal_resolution_384) {
+        display_size.x = 384;
     } else {
         switch (mode->horizontal_resolution) {
         case 0:
@@ -946,6 +1236,8 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
         previous_size.y != display_size.y) {
         rgb24_dirty = true;
     }
+    fb_size.w = display_size.x;
+    fb_size.h = display_size.y;
     ApplyDisplayPendingChanges();
 
     double new_target_fps = mode->pal ? VSYNC_PAL : VSYNC_NTSC;
@@ -954,7 +1246,51 @@ void Draw_SetDisplayMode(DisplayMode* mode) {
     }
 }
 
-int Draw_ExequeSync() { return 0; }
+#ifdef __EMSCRIPTEN__
+void glGetBufferSubData(
+    GLenum target, GLintptr offset, GLsizeiptr size, void* data);
+#endif
+
+int Draw_ExequeSync() {
+    if (!n_readbacks) {
+        return 0;
+    }
+    // WebGL forbids blocking waits, glGetBufferSubData waits instead
+#ifndef __EMSCRIPTEN__
+    while (glClientWaitSync(readback_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
+                            1000000000) == GL_TIMEOUT_EXPIRED) {
+    }
+#endif
+    glDeleteSync(readback_fence);
+    readback_fence = 0;
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, readback_pbo);
+#ifdef __EMSCRIPTEN__
+    u8* map = GetVramConvertBuffer(readback_used);
+    if (map) {
+        glGetBufferSubData(
+            GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)readback_used, map);
+    }
+#else
+    const u8* map = glMapBufferRange(
+        GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)readback_used, GL_MAP_READ_BIT);
+#endif
+    if (map) {
+        for (int i = 0; i < n_readbacks; i++) {
+            const Readback* r = &readbacks[i];
+            ConvertRgba8888ToRgb5551(
+                map + r->offset, (u16*)r->dst, (size_t)r->w * r->h);
+        }
+    } else {
+        ERRORF("failed to map the readback buffer");
+    }
+#ifndef __EMSCRIPTEN__
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+#endif
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    n_readbacks = 0;
+    readback_used = 0;
+    return 0;
+}
 
 static unsigned int VAO = -1, VBO = -1, EBO = -1;
 
@@ -999,6 +1335,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     u16 tpage = -1, clut = -1, pad2, pad3;
     Vertex* v;
 
+    if (isTextured && PrimSamplesDirtyFb(packets, max_len, isPoly, isGouraud,
+                                         cur_tpage, PendingBatchRect())) {
+        Draw_FlushBuffer();
+        SyncDirtyCanvases(NULL);
+    }
     // to ensure we always have space, we pretend we want to allocate a quad
     // Gouraud read-ahead can write a colour into a fifth vertex slot.
     Draw_EnsureBufferWillNotOverflow(5, 6);
@@ -1047,12 +1388,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 len++;
             }
 
-            if (isTextured) {
-                FixupFlipUV(vertex_cur, code & EXTRA_VERTEX);
-            } else {
+            if (!isTextured) {
                 clut = -1;
                 tpage = cur_tpage | TPAGE_NOTEXTURE;
             }
+            tpage |= TPAGE_POLYGON;
             if (CanPolyDither(isGouraud, isTextured, isShadeTex)) {
                 tpage |= TPAGE_DITHER;
             }
@@ -1268,12 +1608,6 @@ void Draw_SetOffset(int x, int y) {
 
     x = x % VRAM_W;
     y = y % VRAM_H;
-    if (x < 0) {
-        x += VRAM_W;
-    }
-    if (y < 0) {
-        y += VRAM_H;
-    }
     draw_offset.x = x;
     draw_offset.y = y;
     if (!sdl3_window && !InitPlatform()) {
@@ -1286,8 +1620,16 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     if (rect->w == 0 || rect->h == 0) {
         return;
     }
+    r = To15BitChannel(r);
+    g = To15BitChannel(g);
+    b = To15BitChannel(b);
     if (!sdl3_window && !InitPlatform()) {
         return;
+    }
+    const VideoLayout layout = ResolveVideoLayout();
+    const SDL_Rect area = {rect->x, rect->y, rect->w, rect->h};
+    if (!layout.native) {
+        LeaveNative();
     }
     MarkRgb24Dirty(rect->x, rect->y, rect->w, rect->h);
     glClearColor((float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, 0.0f);
@@ -1302,46 +1644,118 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     }
     BindDrawFbo();
     UpdateScissor();
+    for (int i = 0; layout.native && i < fb_origin_count; i++) {
+        SDL_Rect fb = GetFbRect(i);
+        if (SDL_HasRectIntersection(&area, &fb) && PrepareCanvas(&layout, i)) {
+            FillRect(canvas_fbo[i],
+                     ScaleRect(
+                         MapVramToCanvas(&layout, i, area, 1), (int)canvas_res),
+                     r, g, b);
+        }
+    }
+}
+
+// uploads the part of the RGBA8888 image that falls in clip
+static void UploadVramPart(const PS1_RECT* rect, const u8* buf, SDL_Rect clip) {
+    const SDL_Rect area = {rect->x, rect->y, rect->w, rect->h};
+    SDL_Rect part;
+    if (!SDL_GetRectIntersection(&area, &clip, &part)) {
+        return;
+    }
+    UploadImage(vram_texture, part.x, part.y, buf, rect->w, part.x - rect->x,
+                part.y - rect->y, part.w, part.h);
+    MarkRgb24Dirty(part.x, part.y, part.w, part.h);
+    SyncNativeVramToScaled(part.x, part.y, part.w, part.h);
 }
 void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
-    if (rect->w == 0 || rect->h == 0) {
+    if (rect->w <= 0 || rect->h <= 0) {
+        return;
+    }
+    if (rect->w * rect->h > VRAM_W * VRAM_H) {
+        WARNF("rect (%d,%d %dx%d) is too large, skipping upload", rect->x,
+              rect->y, rect->w, rect->h);
         return;
     }
     if (!sdl3_window && !InitPlatform()) {
         return;
+    }
+    const VideoLayout layout = ResolveVideoLayout();
+    const SDL_Rect area = {rect->x, rect->y, rect->w, rect->h};
+    const SDL_Rect vram = {0, 0, VRAM_W, VRAM_H};
+    SDL_Rect clamped;
+    if (!layout.native) {
+        LeaveNative();
+        if (!SDL_GetRectIntersection(&area, &vram, &clamped) ||
+            !SDL_RectsEqual(&area, &clamped)) {
+            WARNF("rect (%d,%d %dx%d) is out of bound %dx%d, clamping upload",
+                  rect->x, rect->y, rect->w, rect->h, VRAM_W, VRAM_H);
+        }
     }
     size_t count = (size_t)rect->w * rect->h;
     u8* buf = GetVramConvertBuffer(count * 4);
     if (!buf) {
         return;
     }
-    MarkRgb24Dirty(rect->x, rect->y, rect->w, rect->h);
     ConvertRgb5551ToRgba8888((const u16*)p, buf, count);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, vram_texture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, rect->x, rect->y, rect->w, rect->h,
-                    GL_RGBA, GL_UNSIGNED_BYTE, buf);
-    SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+
+    // an image touching the framebuffer being drawn only writes VRAM inside
+    // it and its canvas gets all of it, so the overhang keeps nearby VRAM
+    int fb_index =
+        layout.native ? FindFbContaining(scissor_rect.x, scissor_rect.y) : -1;
+    SDL_Rect fb = fb_index >= 0 ? GetFbRect(fb_index) : vram;
+    if (fb_index >= 0 && SDL_HasRectIntersection(&area, &fb)) {
+        UploadVramPart(rect, buf, fb);
+        if (PrepareCanvas(&layout, fb_index)) {
+            CanvasUploadImage(&layout, fb_index, rect, buf);
+        }
+        return;
+    }
+    UploadVramPart(rect, buf, vram);
+    for (int i = 0; layout.native && i < fb_origin_count; i++) {
+        fb = GetFbRect(i);
+        if (SDL_HasRectIntersection(&area, &fb) && PrepareCanvas(&layout, i)) {
+            CanvasUploadImage(&layout, i, rect, buf);
+        }
+    }
 }
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
-    if (rect->w == 0 || rect->h == 0) {
+    if (rect->w <= 0 || rect->h <= 0) {
+        return;
+    }
+    size_t bytes = (size_t)rect->w * rect->h * 4;
+    if (bytes > READBACK_BYTES) {
+        WARNF("rect %dx%d is larger than VRAM", rect->w, rect->h);
         return;
     }
     if (!sdl3_window && !InitPlatform()) {
         return;
     }
-    size_t count = (size_t)rect->w * rect->h;
-    u8* buf = GetVramConvertBuffer(count * 4);
-    if (!buf) {
-        return;
+    if (n_readbacks == MAX_PENDING_STORES ||
+        readback_used + bytes > READBACK_BYTES) {
+        Draw_ExequeSync();
+    }
+    if (!readback_pbo) {
+        glGenBuffers(1, &readback_pbo);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, readback_pbo);
+        glBufferData(
+            GL_PIXEL_PACK_BUFFER, READBACK_BYTES, NULL, GL_STREAM_READ);
     }
     Draw_FlushBuffer(); // flush primitives before operating with the VRAM
+    SyncDirtyCanvases(&(SDL_Rect){rect->x, rect->y, rect->w, rect->h});
     glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, readback_pbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(
-        rect->x, rect->y, rect->w, rect->h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-    ConvertRgba8888ToRgb5551(buf, (u16*)p, count);
+    glReadPixels(rect->x, rect->y, rect->w, rect->h, GL_RGBA, GL_UNSIGNED_BYTE,
+                 (void*)(uintptr_t)readback_used);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    if (readback_fence) {
+        glDeleteSync(readback_fence);
+    }
+    readback_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    readbacks[n_readbacks++] = (Readback){
+        .offset = readback_used, .w = rect->w, .h = rect->h, .dst = p};
+    readback_used += bytes;
     BindDrawFbo();
 }
 
@@ -1405,6 +1819,12 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         WARNF("nothing to copy");
         return;
     }
+    const VideoLayout layout = ResolveVideoLayout();
+    if (layout.native) {
+        SyncDirtyCanvases(&(SDL_Rect){src_x, src_y, copy_w, copy_h});
+    } else {
+        LeaveNative();
+    }
 
     // same-FBO blit work-around for MESA and macOS
     if (!EnsureScratchFbo()) {
@@ -1440,6 +1860,13 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     MarkRgb24Dirty(dst_x, dst_y, copy_w, copy_h);
     BindDrawFbo();
     glEnable(GL_SCISSOR_TEST);
+    const SDL_Rect dst = {dst_x, dst_y, copy_w, copy_h};
+    for (int i = 0; layout.native && i < fb_origin_count; i++) {
+        SDL_Rect fb = GetFbRect(i);
+        if (SDL_HasRectIntersection(&dst, &fb) && PrepareCanvas(&layout, i)) {
+            CopyVramToCanvas(i, dst);
+        }
+    }
 }
 void Draw_ResetBuffer(void) {
     n_vertices = 0;
@@ -1483,6 +1910,32 @@ void Draw_FlushBuffer(void) {
     if (VBO == -1) {
         Draw_InitBuffer();
     }
+    // the area is the one of the batch: Draw_SetAreaEnd flushes before
+    // updating scissor_rect
+    const VideoLayout layout = ResolveVideoLayout();
+    int fb_index =
+        layout.native ? FindFbContaining(scissor_rect.x, scissor_rect.y) : -1;
+    SDL_Rect canvas_rect = {0, 0, 0, 0};
+    GLposi offset = draw_offset;
+    if (fb_index >= 0 && PrepareCanvas(&layout, fb_index)) {
+        canvas_rect = MapVramToCanvas(&layout, fb_index, scissor_rect, 1);
+        if (canvas_rect.w <= 0 || canvas_rect.h <= 0) {
+            Draw_ResetBuffer();
+            return;
+        }
+        offset.x += canvas_shift[fb_index].x;
+        offset.y += canvas_shift[fb_index].y;
+        const SDL_Rect s = ScaleRect(canvas_rect, (int)internal_res);
+        glBindFramebuffer(GL_FRAMEBUFFER, canvas_fbo[fb_index]);
+        glScissor(s.x, s.y, s.w, s.h);
+    } else if (layout.native) {
+        fb_index = -1;
+        SyncDirtyCanvases(&scissor_rect);
+    } else {
+        LeaveNative();
+    }
+    const PsyzSize target_size =
+        fb_index >= 0 ? canvas_size : (PsyzSize){VRAM_W, VRAM_H};
 
     glUseProgram(shader_program);
     glBindVertexArray(VAO);
@@ -1499,10 +1952,16 @@ void Draw_FlushBuffer(void) {
         const float grid_scale_x = GetDrawGridXScale();
         const float render_scale = (float)internal_res;
         const GLint viewport_x = (GLint)lroundf(
-            (float)draw_offset.x * render_scale * (1.0f - grid_scale_x));
-        const GLsizei viewport_w =
-            (GLsizei)lroundf((float)VRAM_W * render_scale * grid_scale_x);
-        glViewport(viewport_x, 0, viewport_w, VRAM_H * (GLsizei)internal_res);
+            (float)offset.x * render_scale * (1.0f - grid_scale_x));
+        const GLsizei viewport_w = (GLsizei)lroundf(
+            (float)target_size.w * render_scale * grid_scale_x);
+        glViewport(
+            viewport_x, 0, viewport_w, target_size.h * (GLsizei)internal_res);
+        glUniform2f(uniform_half_pixel, 0.5f / (render_scale * grid_scale_x),
+                    0.5f / render_scale);
+        glUniform2f(uniform_draw_offset, (float)offset.x, (float)offset.y);
+        glUniform2f(
+            uniform_target_size, (float)target_size.w, (float)target_size.h);
     }
     int prim_size = 3;
     int start = 0;
@@ -1534,10 +1993,18 @@ void Draw_FlushBuffer(void) {
             start = end;
         }
     }
-    SyncScaledVramToNative();
-    if (!HasSeparateDrawTarget()) {
-        MarkRgb24Dirty(
-            scissor_rect.x, scissor_rect.y, scissor_rect.w, scissor_rect.h);
+    if (fb_index >= 0) {
+        InvalidateCanvas(&layout, fb_index, scissor_rect);
+        glUniform2f(
+            uniform_draw_offset, (float)draw_offset.x, (float)draw_offset.y);
+        glUniform2f(uniform_target_size, (float)VRAM_W, (float)VRAM_H);
+        RestoreDrawTarget();
+    } else {
+        SyncScaledVramToNative();
+        if (!HasSeparateDrawTarget()) {
+            MarkRgb24Dirty(
+                scissor_rect.x, scissor_rect.y, scissor_rect.w, scissor_rect.h);
+        }
     }
     Draw_ResetBuffer();
 }

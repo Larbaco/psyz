@@ -1,6 +1,8 @@
 #ifndef LIBETC_H
 #define LIBETC_H
 
+#include <psyz/types.h>
+
 /**
  * @file libetc.h
  * @brief Utility Library
@@ -54,6 +56,20 @@ extern int PadIdentifier;
 /* Video modes */
 #define MODE_NTSC 0 /**< NTSC video mode */
 #define MODE_PAL 1  /**< PAL video mode */
+
+/**
+ * @brief Address of a word in the scratchpad
+ *
+ * The scratchpad is 1 KiB of fast RAM, at 0x1F800000 on the PlayStation;
+ * psyz keeps it in an ordinary array. `offset` counts u_long words, which
+ * are 64-bit on 64-bit targets, so there psyz's scratchpad is 2 KiB.
+ */
+#ifdef __psyz
+extern unsigned char Psyz_Scratchpad[256 * sizeof(u_long)];
+#define getScratchAddr(offset) ((u_long*)Psyz_Scratchpad + (offset))
+#else
+#define getScratchAddr(offset) ((u_long*)(0x1f800000 + (offset) * 4))
+#endif
 
 /**
  * @brief System callbacks structure

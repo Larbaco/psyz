@@ -142,6 +142,7 @@ ZTEST(gpu, fnt_print) {
 }
 
 ZTEST(gpu, draw_ft4) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     if (LoadTim(img_4bpp, &tpage, &clut)) {
         return;
@@ -166,6 +167,7 @@ ZTEST(gpu, draw_ft4) {
 }
 
 ZTEST(gpu, draw_ft4_colored) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     if (LoadTim(img_4bpp, &tpage, &clut)) {
         return;
@@ -191,6 +193,7 @@ ZTEST(gpu, draw_ft4_colored) {
 
 ZTEST(gpu, draw_gt4) {
     zskip_targets("pcsx-redux"); // differs from real hardware
+    zskip_targets("ppsspp");     // subpixel vertex emulation broken
     u_short tpage, clut;
     if (LoadTim(img_4bpp, &tpage, &clut)) {
         return;
@@ -392,6 +395,7 @@ ZTEST(gpu, draw_lines) {
 }
 
 ZTEST(gpu, set_draw_area) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     DR_AREA drArea;
     RECT area = {4, 8, 56, 48};
@@ -456,6 +460,7 @@ ZTEST(gpu, swap_buffer) {
 }
 
 ZTEST(gpu, drawenv_clear_vram) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     const char* ci = getenv("CI");
     const char* os = getenv("OS");
     u_short tpage, clut;
@@ -506,6 +511,7 @@ ZTEST(gpu, drawenv_clear_vram) {
 }
 
 ZTEST(gpu, move_image) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     RECT rect = {16, 16, 64, 64};
     if (LoadTim(img_4bpp, &tpage, &clut)) {
@@ -573,7 +579,8 @@ ZTEST(gpu, move_image_internal_res) {
     u_short readback[16 * 16];
     RECT rectStore = {704, 320, 16, 16};
     zskip_targets("psp;ps1");
-    zassert_s32_eq(-1, Psyz_VideoSetInternalResolution(0));
+    zassert_s32_eq(
+        -1, Psyz_VideoSetInternalResolution(PSYZ_INTERNAL_RES_MAX + 1));
     zassert_s32_eq(0, Psyz_VideoSetInternalResolution(2));
     zassert_s32_eq(2, Psyz_VideoGetInternalResolution());
 
@@ -732,6 +739,38 @@ ZTEST(gpu, clear_screen_draw_offset_bugfix) {
     ASSERT_FRAME("clear_screen_draw_offset_bugfix", 0, 1.0f);
 }
 
+ZTEST(gpu, negative_draw_offset) {
+    zskip_targets("ppsspp"); // broken on ppsspp v1.20.4
+    DRAWENV draw;
+    ClearImage(&cdb->draw.clip, 60, 120, 120);
+    DrawSync(0);
+
+    draw = cdb->draw;
+    draw.ofs[0] = -32;
+    draw.ofs[1] = -48;
+    PutDrawEnv(&draw);
+
+    SetTile(&cdb->tile[0]);
+    setRGB0(&cdb->tile[0], 255, 0, 0);
+    setXY0(&cdb->tile[0], 64, 80);
+    setWH(&cdb->tile[0], 64, 64);
+
+    // left and top edges sit before the origin and get clipped by draw.ofs
+    SetPolyF4(&cdb->f4[0]);
+    setRGB0(&cdb->f4[0], 0, 255, 0);
+    setXYWH(&cdb->f4[0], 16, 32, 64, 48);
+
+    ClearOTag(cdb->ot, OTSIZE);
+    AddPrim(cdb->ot, &cdb->tile[0]);
+    AddPrim(cdb->ot, &cdb->f4[0]);
+
+    DrawOTag(cdb->ot);
+    DrawSync(0);
+    VSync(0);
+    PutDispEnv(&cdb->disp);
+    ASSERT_FRAME("negative_draw_offset", 0, 1.0f);
+}
+
 // TODO: test is actually failing
 ZTEST(gpu, load_move_image_priority) {
     TIM_IMAGE tim;
@@ -766,6 +805,7 @@ ZTEST(gpu, load_move_image_priority) {
 }
 
 ZTEST(gpu, flipped_xy) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     if (LoadTim(img_uv_4bpp, &tpage, &clut)) {
         return;
@@ -811,6 +851,7 @@ ZTEST(gpu, flipped_xy) {
 }
 
 ZTEST(gpu, flipped_uv) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     if (LoadTim(img_uv_4bpp, &tpage, &clut)) {
         return;
@@ -862,6 +903,7 @@ ZTEST(gpu, flipped_uv) {
 }
 
 ZTEST(gpu, flipped_xy_uv) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     u_short tpage, clut;
     if (LoadTim(img_uv_4bpp, &tpage, &clut)) {
         return;
@@ -968,12 +1010,14 @@ static void DrawAlphaBlend(int flip_stp) {
 
 ZTEST(gpu, alpha_blend) {
     zskip_targets("pcsx-redux"); // differs from real hardware
+    zskip_targets("ppsspp");     // subpixel vertex emulation broken
     DrawAlphaBlend(0);
     ASSERT_FRAME("alpha_blend", 1, 1.0f);
 }
 
 ZTEST(gpu, alpha_blend_stp_flipped) {
     zskip_targets("pcsx-redux"); // differs from real hardware
+    zskip_targets("ppsspp");     // subpixel vertex emulation broken
     DrawAlphaBlend(1);
     ASSERT_FRAME("alpha_blend_stp_flipped", 1, 1.0f);
 }
@@ -998,14 +1042,15 @@ ZTEST(gpu, s11_coord_truncation) {
 }
 
 ZTEST(gpu, untextured_transp_poly_take_abr_from_drawenv) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     const int16_t bx[4] = {8, 88, 8, 88};
     const int16_t by[4] = {8, 8, 88, 88};
     ClearImage(&cdb->draw.clip, 0x60, 0x60, 0x60);
-    DrawSync(0);
 
     for (int i = 0; i < 4; i++) {
         POLY_F4 poly;
         unsigned* words;
+        DrawSync(0);
         Psyz_GpuWriteGP0(_get_mode(1, 0, getTPage(0, i, 0, 0)));
 
         SetPolyF4(&poly);
@@ -1062,8 +1107,59 @@ ZTEST(gpu, uv_minification) {
     VSync(0);
     PutDispEnv(&cdb->disp);
 
-    // PSP has its own golden: a slightly different minification algorithm
     ASSERT_FRAME("uv_minification", 0, 0.9995f);
+}
+
+static void SetShearedTile(
+    POLY_FT4* poly, int x, int y, int sx, int sy, u_short tpage) {
+    enum { TILE = 16 };
+    SetPolyFT4(poly);
+    setRGB0(poly, 128, 128, 128);
+    setXY4(poly, x, y, x + TILE, y + sy, x + sx, y + TILE, x + TILE + sx,
+           y + TILE + sy);
+    setUV4(poly, TILE, TILE, TILE + TILE - 1, TILE, TILE, TILE + TILE - 1,
+           TILE + TILE - 1, TILE + TILE - 1);
+    poly->tpage = tpage;
+    poly->clut = 0;
+}
+
+ZTEST(gpu, polygon_corner_sampling) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
+    enum { TEX_X = 640, TEX_Y = 256, TEX_SIZE = 48 };
+    enum { INSIDE = 0x03E0, OUTSIDE = 0x7C1F };
+    static const short shear[] = {-24, -16, -9, -1, 0, 1, 9, 16, 24};
+    static u_short texture[TEX_SIZE * TEX_SIZE];
+    static POLY_FT4 poly[2 * LEN(shear)];
+    RECT texRect = {TEX_X, TEX_Y, TEX_SIZE, TEX_SIZE};
+    u_short tpage = GetTPage(2, 0, TEX_X, TEX_Y);
+
+    for (int v = 0; v < TEX_SIZE; v++) {
+        for (int u = 0; u < TEX_SIZE; u++) {
+            int inTile = u >= 16 && u <= 31 && v >= 16 && v <= 31;
+            texture[v * TEX_SIZE + u] = inTile ? INSIDE : OUTSIDE;
+        }
+    }
+    LoadImage(&texRect, (u_long*)texture);
+    DrawSync(0);
+
+    ClearOTag(cdb->ot, OTSIZE);
+    for (int i = 0; i < LEN(shear); i++) {
+        int s = shear[i];
+        int lift = s < 0 ? -s : 0;
+        int column = i < 5 ? i : i - 5;
+        SetShearedTile(
+            &poly[i], 8 + column * 48 + lift, i < 5 ? 8 : 40, s, 0, tpage);
+        SetShearedTile(
+            &poly[LEN(shear) + i], 8 + i * 26, 80 + lift, 0, s, tpage);
+        AddPrim(cdb->ot, &poly[i]);
+        AddPrim(cdb->ot, &poly[LEN(shear) + i]);
+    }
+    ClearImage(&cdb->draw.clip, 0, 0, 0);
+    DrawOTag(cdb->ot);
+    DrawSync(0);
+    VSync(0);
+    PutDispEnv(&cdb->disp);
+    ASSERT_FRAME("polygon_corner_sampling", 0, 1.0f);
 }
 
 ZTEST(gpu, texture_window_tiling) {
@@ -1208,6 +1304,7 @@ ZTEST(gpu, texture_window_non_square) {
 }
 
 ZTEST(gpu, marge_prim) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     SetPolyF4(&cdb->f4[0]);
     setXYWH(&cdb->f4[0], 16, 16, 64, 64);
     setRGB0(&cdb->f4[0], 0, 0, 255);
@@ -1229,6 +1326,62 @@ ZTEST(gpu, marge_prim) {
     AddPrim(cdb->ot, &cdb->f4[2]);
     AddPrim(cdb->ot, &cdb->f4[0]);
     Present("marge_prim");
+}
+
+ZTEST(gpu, screen_copy_after_draw_env_sees_earlier_prims) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
+    u_short tpage, clut;
+    DR_ENV drEnv;
+    POLY_FT4* screenCopy = &cdb->ft4[0];
+    POLY_FT4* sprite = &cdb->ft4[1];
+    TILE* hud = &cdb->tile[0];
+    TILE* background = &cdb->tile[1];
+    TILE* hole = &cdb->tile[2];
+    if (LoadTim(img_4bpp, &tpage, &clut)) {
+        return;
+    }
+
+    SetTile(background);
+    setXY0(background, 32, 32);
+    setWH(background, 192, 176);
+    setRGB0(background, 40, 90, 160);
+
+    SetTile(hole);
+    setXY0(hole, 112, 96);
+    setWH(hole, 48, 48);
+    setRGB0(hole, 0, 0, 0);
+
+    SetDrawEnv(&drEnv, &cdb->draw);
+
+    SetPolyFT4(sprite);
+    setXYWH(sprite, 80, 72, 64, 64);
+    setRGB0(sprite, 128, 128, 128);
+    setUVWH(sprite, 0, 0, 64, 64);
+    setSemiTrans(sprite, 0);
+    sprite->tpage = tpage;
+    sprite->clut = clut;
+
+    SetTile(hud);
+    setXY0(hud, 24, 184);
+    setWH(hud, 208, 24);
+    setRGB0(hud, 200, 40, 40);
+
+    SetPolyFT4(screenCopy);
+    setXYWH(screenCopy, 16, 16, 224, 208);
+    setRGB0(screenCopy, 128, 128, 128);
+    setUVWH(screenCopy, 16, 16, 224, 208);
+    setSemiTrans(screenCopy, 0);
+    screenCopy->tpage = GetTPage(2, 0, 0, 0);
+    screenCopy->clut = 0;
+
+    ClearOTag(cdb->ot, OTSIZE);
+    AddPrim(cdb->ot, screenCopy);
+    AddPrim(cdb->ot, hud);
+    AddPrim(cdb->ot, sprite);
+    AddPrim(cdb->ot, &drEnv);
+    AddPrim(cdb->ot, hole);
+    AddPrim(cdb->ot, background);
+    Present("screen_copy_after_draw_env_sees_earlier_prims");
 }
 
 enum {
@@ -1271,6 +1424,7 @@ ZTEST_SETUP(dither) {
 ZTEST_TEARDOWN(dither) { ResetGraph(0); }
 
 ZTEST(dither, dithering_drawenv_disabled) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     cdb->draw.dtd = 0;
     PutDrawEnv(&cdb->draw);
 
@@ -1285,6 +1439,7 @@ ZTEST(dither, dithering_drawenv_disabled) {
 }
 
 ZTEST(dither, dithering_gouraud_on) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     SetPolyG4(&cdb->g4[0]);
     setXYWH(&cdb->g4[0], 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
     setRGB0(&cdb->g4[0], DR, DG, DB);
@@ -1296,6 +1451,7 @@ ZTEST(dither, dithering_gouraud_on) {
 }
 
 ZTEST(dither, dithering_flat_off) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     SetPolyF4(&cdb->f4[0]);
     setXYWH(&cdb->f4[0], 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
     setRGB0(&cdb->f4[0], DR, DG, DB);
@@ -1305,6 +1461,7 @@ ZTEST(dither, dithering_flat_off) {
 
 ZTEST(dither, dithering_flat_blending_on) {
     zskip_targets("pcsx-redux"); // differs from real hardware
+    zskip_targets("ppsspp");     // subpixel vertex emulation broken
     // PSP has its own golden: the dithering matrix is fixed in the GPU
     // pipeline, it can't be changed to reflect the exact identical look on PS1.
     u_short tpage = MakeFlatTPage();
@@ -1425,6 +1582,7 @@ ZTEST(dither, dithering_sprite_blending_off) {
 }
 
 ZTEST(dither, dithering_pattern_alignment) {
+    zskip_targets("ppsspp"); // subpixel vertex emulation broken
     enum {
         SIZE = 5, // 5x5 tile
         BAND_H = 60,
@@ -1624,6 +1782,15 @@ ZTEST(gpu, vsync_callback_runs_every_frame) {
     vsync_callback_count = 0;
     VSync(0);
     zexpect_s32_eq(0, vsync_callback_count);
+}
+
+ZTEST(gpu, vsync_n_waits_n_vblanks) {
+    int start;
+    VSync(0);
+    start = VSync(-1);
+    VSync(3);
+    // the counter's phase can lose one of the three to rounding
+    zexpect_s32_ge(start + 2, VSync(-1));
 }
 
 static volatile int vsync_order[16];

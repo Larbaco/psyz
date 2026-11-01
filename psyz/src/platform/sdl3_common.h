@@ -3,6 +3,7 @@
 #define SDL3_COMMON_H
 
 #include <SDL3/SDL.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -12,6 +13,10 @@
 #include <psyz/overlay.h>
 #include <psyz/overlay_sdl3.h>
 #include "../internal.h"
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#include "../video_layout.h"
 #ifdef PLATFORM_IOS
 #include "../ios/ios_platform.h"
 #endif
@@ -31,6 +36,7 @@
 static bool PlatformBackend_SetDriverVsync(bool enable);
 static void PlatformBackend_Present(void);
 static void QuitPlatform(void);
+bool InitPlatform(void);
 #ifdef PLATFORM_WEB
 void Psyz_WebWaitForNextFrame(void);
 #endif
@@ -115,12 +121,12 @@ static void* GetVramConvertBuffer(size_t size) {
 
 static bool disp_on = false;
 static int set_disp_horiz = 256;
-static int set_disp_vert = 240;
-static int cur_disp_horiz = -1;
-static int cur_disp_vert = -1;
-static bool is_pal = false;
 static PsyzAspectMode aspect_mode = PSYZ_ASPECT_DISPLAY;
 static WndSize wnd_size_in_pixels = {0, 0};
+static PsyzSize fb_size = {256, 240}; // PS1 display mode
+static PsyzSize res_request = {0, 0}; // PSYZ_DEFAULT_RESOLUTION
+static PsyzAnchor video_anchor = PSYZ_ANCHOR_CENTER;
+static PsyzSize simulated_display;
 
 static void SetWindowSizeInPixels(int width, int height) {
     if (!sdl3_window) {
@@ -139,12 +145,7 @@ static void SetWindowSizeInPixels(int width, int height) {
 
 static float GetCurrentGameAspectRatio(int disp_w, int disp_h) {
     if (aspect_mode == PSYZ_ASPECT_DISPLAY) {
-        // PAL too uses the 240-line reference: a PAL release of an NTSC
-        // game (DW3 EU) keeps the 240-line picture, which a 288-line
-        // reference stretched to 16:10.
-        float vref = 240.0f;
-        return (4.0f / 3.0f) * ((float)set_disp_horiz / 256.0f) /
-               ((float)set_disp_vert / vref);
+        return (4.0f / 3.0f) * ((float)set_disp_horiz / 256.0f);
     }
     if (disp_h <= 0) {
         return 4.0f / 3.0f;
@@ -194,7 +195,7 @@ static double target_frame_time_us = 1000000.0 / VSYNC_NTSC;
 static Uint64 perf_frequency = 0;
 static Uint64 last_frame_time = 0;
 static Uint64 finish_time = 0;
-static double drift_compensation = 0.0;
+static Uint64 frame_deadline = 0; // when the frame limiter releases the frame
 static PsyzVsyncMode vsync_mode = PSYZ_VSYNC_AUTO;
 static PsyzDitherMode dither_mode = PSYZ_DITHER_AUTO;
 static bool use_driver_vsync = false;
@@ -232,17 +233,234 @@ void Psyz_SetTitle(const char* str) {
     }
 }
 
-PsyzSize Psyz_VideoGetDisplaySize(void) {
-    PsyzSize s = {0, 0};
+static PsyzSize Sdl3Common_DisplaySize(void) {
+    PsyzSize s = simulated_display;
+    if (s.w > 0 && s.h > 0) {
+        return s;
+    }
+    s.w = 0;
+    s.h = 0;
     if (sdl3_window) {
         SDL_GetWindowSizeInPixels(sdl3_window, &s.w, &s.h);
     }
     return s;
 }
 
-void Psyz_VideoSetDrawArea(PsyzRect rect) {
-    // not usable on SDL3, consoles only
-    (void)rect;
+// call at the end of InitPlatform, after is_platform_init_successful is set.
+// at the moment is just used to parse the PSYZ_VIDEO_DISPLAY env var.
+static void Sdl3Common_VideoInit(void) {
+    const char* env = SDL_getenv("PSYZ_VIDEO_DISPLAY");
+    int w = 0, h = 0;
+    if (env && SDL_sscanf(env, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+        simulated_display.w = w;
+        simulated_display.h = h;
+    }
+}
+
+PsyzSize Psyz_VideoGetDisplaySize(void) {
+    if (!sdl3_window) {
+        InitPlatform();
+    }
+    return Sdl3Common_DisplaySize();
+}
+
+int Psyz_VideoSimulateDisplay(PsyzSize size) {
+    if (size.w < 0 || size.h < 0 || (size.w == 0) != (size.h == 0)) {
+        return -1;
+    }
+    simulated_display = size;
+    return 0;
+}
+
+int Psyz_VideoSetResolution(PsyzSize size) {
+    const PsyzSize max = {VIDEO_LAYOUT_MAX_REQUEST, VIDEO_LAYOUT_MAX_REQUEST};
+    if (!VideoLayout_IsRequestValid(size, max)) {
+        return -1;
+    }
+    res_request = size;
+    return 0;
+}
+
+int Psyz_VideoSetAnchor(PsyzAnchor anchor) {
+    if (!VideoLayout_IsValidAnchor(anchor)) {
+        return -1;
+    }
+    video_anchor = anchor;
+    return 0;
+}
+
+PsyzAnchor Psyz_VideoGetAnchor(void) { return video_anchor; }
+
+static VideoLayout ResolveVideoLayout(void) {
+    VideoLayoutIn in = {0};
+    VideoLayout layout;
+    in.display = Sdl3Common_DisplaySize();
+    in.fb = fb_size;
+    in.request = res_request;
+    in.anchor = video_anchor;
+    in.aspect = aspect_mode;
+    in.range_w = set_disp_horiz;
+    in.max_canvas.w = VRAM_W;
+    in.max_canvas.h = VRAM_H;
+    VideoLayout_Resolve(&in, &layout);
+    return layout;
+}
+
+PsyzRect Psyz_VideoGetDrawArea(void) {
+    Psyz_VideoGetDisplaySize();
+    return ResolveVideoLayout().screen;
+}
+
+// In native mode each framebuffer gets a canvas: primitives drawn inside a
+// framebuffer land on its canvas and get copied back to VRAM before reads.
+// This avoids the need of expanding the emulated PS1 VRAM.
+#define FB_COUNT 2
+#define CANVAS_DISCARDED INT_MIN
+typedef struct {
+    int x, y;
+} FbOrigin;
+static FbOrigin fb_origins[FB_COUNT];
+static int fb_origin_count;
+static int fb_last_index;
+static SDL_Rect canvas_dirty[FB_COUNT]; // VRAM rect not copied back yet
+static FbOrigin canvas_shift[FB_COUNT]; // VRAM to canvas shift of the content
+static bool internal_res_auto;
+
+static int FindFbByOrigin(int x, int y) {
+    for (int i = 0; i < fb_origin_count; i++) {
+        if (fb_origins[i].x == x && fb_origins[i].y == y) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static SDL_Rect GetFbRect(int fb_index) {
+    return (SDL_Rect){fb_origins[fb_index].x, fb_origins[fb_index].y, fb_size.w,
+                      fb_size.h};
+}
+
+static void DiscardCanvas(int fb_index) {
+    canvas_dirty[fb_index] = (SDL_Rect){0, 0, 0, 0};
+    canvas_shift[fb_index].x = CANVAS_DISCARDED;
+}
+
+static int AddFbOrigin(int x, int y, bool* replaced) {
+    int fb_index = FindFbByOrigin(x, y);
+    *replaced = fb_index < 0;
+    if (fb_index < 0) {
+        fb_index =
+            fb_origin_count < FB_COUNT ? fb_origin_count++ : fb_last_index ^ 1;
+        fb_origins[fb_index].x = x;
+        fb_origins[fb_index].y = y;
+    }
+    fb_last_index = fb_index;
+    return fb_index;
+}
+
+static int FindFbContaining(int x, int y) {
+    bool replaced;
+    if (fb_origin_count == 0) {
+        int fb_index = AddFbOrigin(x, y, &replaced);
+        DiscardCanvas(fb_index);
+        return fb_index;
+    }
+    for (int i = 0; i < fb_origin_count; i++) {
+        if (x >= fb_origins[i].x && x < fb_origins[i].x + fb_size.w &&
+            y >= fb_origins[i].y && y < fb_origins[i].y + fb_size.h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static FbOrigin GetCanvasShift(const VideoLayout* l, int fb_index) {
+    return (FbOrigin){-fb_origins[fb_index].x - l->screen.sx,
+                      -fb_origins[fb_index].y - l->screen.sy};
+}
+
+static bool IsCanvasLayoutCurrent(const VideoLayout* l, int fb_index) {
+    FbOrigin shift = GetCanvasShift(l, fb_index);
+    return canvas_shift[fb_index].x == shift.x &&
+           canvas_shift[fb_index].y == shift.y;
+}
+
+// maps a VRAM rect to canvas pixels, edges touching the framebuffer extend
+static SDL_Rect MapVramToCanvas(
+    const VideoLayout* l, int fb_index, SDL_Rect vram, int extend) {
+    PsyzRect r = VideoLayout_MapArea(
+        l, fb_origins[fb_index].x, fb_origins[fb_index].y,
+        Psyz_RectFromSize(vram.x, vram.y, vram.w, vram.h), extend);
+    return (SDL_Rect){r.sx, r.sy, r.ex - r.sx, r.ey - r.sy};
+}
+
+static void InvalidateCanvas(
+    const VideoLayout* l, int fb_index, SDL_Rect vram) {
+    FbOrigin shift = GetCanvasShift(l, fb_index);
+    SDL_Rect fb = GetFbRect(fb_index);
+    SDL_Rect canvas = {-shift.x, -shift.y, l->canvas.w, l->canvas.h};
+    if (!SDL_GetRectIntersection(&vram, &fb, &vram) ||
+        !SDL_GetRectIntersection(&vram, &canvas, &vram)) {
+        return;
+    }
+    SDL_GetRectUnion(&canvas_dirty[fb_index], &vram, &canvas_dirty[fb_index]);
+    canvas_shift[fb_index] = shift;
+}
+
+static SDL_Rect GetCanvasPresentRect(
+    const VideoLayout* l, int win_w, int win_h) {
+    PsyzSize sim = simulated_display;
+    PsyzRect p = l->present;
+    if (sim.w > 0 && sim.h > 0) {
+        PsyzRect fit = VideoLayout_Present((PsyzSize){win_w, win_h}, sim, sim);
+        int fw = (int)Psyz_GetRectWidth(fit), fh = (int)Psyz_GetRectHeight(fit);
+        p = (PsyzRect){fit.sx + p.sx * fw / sim.w, fit.sy + p.sy * fh / sim.h,
+                       fit.sx + p.ex * fw / sim.w, fit.sy + p.ey * fh / sim.h};
+    }
+    return (SDL_Rect){p.sx, p.sy, p.ex - p.sx, p.ey - p.sy};
+}
+
+static unsigned GetAutoInternalRes(const VideoLayout* l) {
+    int n;
+    if (!l->native) {
+        return 1;
+    }
+    n = MIN((int)Psyz_GetRectWidth(l->present) / l->canvas.w,
+            (int)Psyz_GetRectHeight(l->present) / l->canvas.h);
+    return (unsigned)CLAMP(n, 1, PSYZ_INTERNAL_RES_MAX);
+}
+
+static bool OverlapsDirtyCanvas(SDL_Rect r, SDL_Rect pending) {
+    if (SDL_HasRectIntersection(&r, &pending)) {
+        return true;
+    }
+    for (int i = 0; i < fb_origin_count; i++) {
+        if (SDL_HasRectIntersection(&r, &canvas_dirty[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline u_char To15BitChannel(u_char c) {
+    return (u_char)(((c >> 3) * 255 + 15) / 31);
+}
+
+static bool PrimSamplesDirtyFb(
+    const u_long* p, int len, bool is_poly, bool is_gouraud, u16 cur_tpage,
+    SDL_Rect pending) {
+    const int tpage_word = is_gouraud ? 5 : 4;
+    if (len <= (is_poly ? tpage_word : 2)) {
+        return false;
+    }
+    u16 clut = (u16)(p[2] >> 16);
+    u16 tpage = is_poly ? (u16)(p[tpage_word] >> 16) : cur_tpage;
+    int bpp = MIN((tpage >> 7) & 3, 2);
+    SDL_Rect page = {(tpage & 15) * 64, ((tpage >> 4) & 1) * 256, 64 << bpp,
+                     256};
+    SDL_Rect pal = {(clut & 63) * 16, (clut >> 6) & 511, bpp ? 256 : 16, 1};
+    return OverlapsDirtyCanvas(page, pending) ||
+           (bpp < 2 && OverlapsDirtyCanvas(pal, pending));
 }
 
 static double GetElapsedMicroseconds(Uint64 start, Uint64 end) {
@@ -268,7 +486,10 @@ static void ConfigureVSync(double target_fps) {
         return;
     }
 
-    SDL_DisplayID display_id = SDL_GetPrimaryDisplay();
+    SDL_DisplayID display_id = SDL_GetDisplayForWindow(sdl3_window);
+    if (!display_id) {
+        display_id = SDL_GetPrimaryDisplay();
+    }
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
     double detected_framerate = 60.0;
     if (mode && mode->refresh_rate > 0.0f) {
@@ -294,8 +515,8 @@ static void ConfigureVSync(double target_fps) {
 static void UpdateTargetFramerate(double fps) {
     target_frame_rate = fps;
     target_frame_time_us = 1000000.0 / fps;
-    drift_compensation = 0.0;
     last_frame_time = SDL_GetPerformanceCounter();
+    frame_deadline = last_frame_time;
     ConfigureVSync(target_frame_rate);
 }
 
@@ -360,8 +581,8 @@ static void Sdl3Common_ApplyPendingTimingReset(void) {
         return;
     }
     SDL_SetAtomicInt(&timing_reset_requested, 0);
-    drift_compensation = 0.0;
     last_frame_time = SDL_GetPerformanceCounter();
+    frame_deadline = last_frame_time;
     finish_time = last_frame_time;
     last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
     if (sdl3_window && is_platform_init_successful) {
@@ -377,6 +598,11 @@ int Psyz_QuitRequested(void) { return SDL_GetAtomicInt(&quit_requested) != 0; }
 
 // Initialize the timing/vsync state. Call once at the end of InitPlatform.
 static void Sdl3Common_TimingInit(void) {
+#ifdef __linux__
+    // Wake up from sleeps as close as possible to the frame limiter deadline.
+    // Fixes jittering on Linux. I only tested this on the default scheduler.
+    prctl(PR_SET_TIMERSLACK, 1);
+#endif
     last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
     perf_frequency = SDL_GetPerformanceFrequency();
     last_frame_time = SDL_GetPerformanceCounter();
@@ -402,48 +628,39 @@ static void Sdl3Common_Shutdown(void) {
     SDL_SetAtomicInt(&resume_audio_on_foreground, 0);
 }
 
-static void WaitForNextFrame(void) {
-    Uint64 current_time = SDL_GetPerformanceCounter();
-    double elapsed_us = GetElapsedMicroseconds(last_frame_time, current_time);
+// Paces `frames` vertical blanks since the previous call. Driver VSync
+// already waited for one in the present and repeats it for the rest, the
+// frame limiter uses the timer instead.
+static void WaitForNextFrame(int frames) {
+    double target_us = target_frame_time_us * frames;
 
 #ifdef PLATFORM_WEB
     // yield to browser
-    (void)elapsed_us;
-    Psyz_WebWaitForNextFrame();
+    for (; frames > 0; frames--) {
+        Psyz_WebWaitForNextFrame();
+    }
 #else
-    if (!use_driver_vsync && vsync_mode != PSYZ_VSYNC_LIMITLESS) {
-        double time_to_wait_us =
-            target_frame_time_us - elapsed_us + drift_compensation;
-
-        // only wait if we're ahead of schedule (not running slow)
-        if (time_to_wait_us > 100.0) { // more than 0.1ms to wait
-            // High-precision mode: sleep + busy-wait
-            if (time_to_wait_us > 1000.0) {
-                Uint64 sleep_us = (Uint64)(time_to_wait_us - 1000.0);
-                SDL_DelayNS(sleep_us * 1000);
-            }
-
-            // busy-wait for precision
-            double target_elapsed = target_frame_time_us + drift_compensation;
-            while (GetElapsedMicroseconds(
-                       last_frame_time, SDL_GetPerformanceCounter()) <
-                   target_elapsed) {
-            }
+    if (use_driver_vsync) {
+        for (int i = 1; i < frames; i++) {
+            PlatformBackend_Present();
         }
-
-        // measure actual frame time and compensate drift
-        Uint64 frame_end_time = SDL_GetPerformanceCounter();
-        double actual_frame_time =
-            GetElapsedMicroseconds(last_frame_time, frame_end_time);
-        double frame_error = actual_frame_time - target_frame_time_us;
-
-        // apply gentle correction (10% per frame)
-        drift_compensation -= frame_error * 0.1;
-        if (drift_compensation > 5000.0) {
-            drift_compensation = 5000.0;
+        double floor_us = target_us - target_frame_time_us / 2;
+        Uint64 floor_time =
+            last_frame_time + (Uint64)(floor_us * (double)perf_frequency / 1e6);
+        Uint64 current_time = SDL_GetPerformanceCounter();
+        if (current_time < floor_time) {
+            SDL_DelayPrecise(SDL_NS_PER_SECOND * (floor_time - current_time) /
+                             perf_frequency);
         }
-        if (drift_compensation < -5000.0) {
-            drift_compensation = -5000.0;
+    } else if (vsync_mode != PSYZ_VSYNC_LIMITLESS) {
+        Uint64 current_time = SDL_GetPerformanceCounter();
+        Uint64 period = (Uint64)(target_us * (double)perf_frequency / 1e6);
+        frame_deadline += period;
+        if (current_time > frame_deadline + period) {
+            frame_deadline = current_time;
+        } else if (current_time < frame_deadline) {
+            SDL_DelayPrecise(SDL_NS_PER_SECOND *
+                             (frame_deadline - current_time) / perf_frequency);
         }
     }
 #endif
@@ -453,7 +670,7 @@ static void WaitForNextFrame(void) {
         GetElapsedMicroseconds(last_frame_time, frame_end_time);
     gpu_stats.last_draw_time_us =
         GetElapsedMicroseconds(last_frame_time, finish_time);
-    gpu_stats.target_frame_time_us = target_frame_time_us;
+    gpu_stats.target_frame_time_us = target_us;
     gpu_stats.total_frames++;
     gpu_stats.using_driver_vsync = use_driver_vsync;
 
@@ -470,10 +687,10 @@ int Psyz_VideoVSync(int mode) {
     // a line is approximated as 64 us
     now_us = (Uint32)(SDL_GetTicksNS() / 1000);
     ret = (unsigned short)((now_us - last_vsync_us) >> 6);
-    if (mode == 0) {
+    if (mode == 0 || mode > 1) {
         PlatformBackend_Present();
         PollEvents();
-        WaitForNextFrame();
+        WaitForNextFrame(mode > 1 ? mode : 1);
         last_vsync_us = (Uint32)(SDL_GetTicksNS() / 1000);
     }
     return ret;
@@ -884,6 +1101,12 @@ static void PollEvents(void) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             SDL_GetWindowSizeInPixels(
                 sdl3_window, &wnd_size_in_pixels.w, &wnd_size_in_pixels.h);
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            if (is_platform_init_successful) {
+                ConfigureVSync(target_frame_rate);
+            }
             break;
         case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
 #ifdef PLATFORM_IOS

@@ -3,6 +3,7 @@
 #include <kernel.h>
 #include <libetc.h>
 #include "libgpu.h"
+#include "krom_font.h"
 #include "../draw.h"
 #include "../internal.h"
 
@@ -35,7 +36,6 @@ static int pads_sampled = 0; // avoid more than one input polling per frame
 static char* pad_buffers[2];
 static int pad_buffer_lens[2];
 static void ReadPadsOnVsync(void) {
-    pads_sampled = 0;
     for (int p = 0; p < LEN(ports); p++) {
         if (pad_buffers[p]) {
             Psyz_PadsGet(p, pad_buffers[p], pad_buffer_lens[p]);
@@ -50,7 +50,8 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
     return prev;
 }
 
-// Known limitation: VSync(n) with n > 1 paces a single frame, not n vblanks
+// VSync(n) with n > 1 presents once and waits n vertical blanks since the
+// previous VSync, as the SDK does for games that run at 30 or 20 fps.
 int VSync(int mode) {
     int elapsed, n;
     Psyz_KernelPoll();
@@ -58,19 +59,14 @@ int VSync(int mode) {
         return Psyz_VideoVSync(-1);
     } else if (mode == 1) {
         return Psyz_VideoVSync(1);
-    } else if (mode > 1) {
-        static int logged_once = 0;
-        if (!logged_once) {
-            logged_once = 1;
-            WARNF("VSync(n>1) is not fully implemented.");
-        }
     }
     n = mode > 0 ? mode : 1;
-    elapsed = Psyz_VideoVSync(0);
-    ReadPadsOnVsync(); // this is done on vsync by the BIOS
+    elapsed = Psyz_VideoVSync(mode);
+    pads_sampled = 0;
     if (g_PsyzVsyncCb) {
         g_PsyzVsyncCb();
     }
+    ReadPadsOnVsync(); // this is done on vsync by the BIOS
     for (; n > 0; n--) {
         Psyz_KernelVBlank();
     }
@@ -192,6 +188,44 @@ long psyz_undelete(char* name) {
 
 long my_format(char* fs);
 long format(char* fs) { return my_format(fs); }
+
+static const struct {
+    unsigned short first, last;
+} krom_non_kanji[] = {
+    {0x8140, 0x817E}, {0x8180, 0x81AC}, {0x81B8, 0x81BF}, {0x81C8, 0x81CE},
+    {0x81DA, 0x81E8}, {0x81F0, 0x81F7}, {0x81FC, 0x81FC}, {0x824F, 0x8258},
+    {0x8260, 0x8279}, {0x8281, 0x829A}, {0x829F, 0x82F1}, {0x8340, 0x837E},
+    {0x8380, 0x8396}, {0x839F, 0x83B6}, {0x83BF, 0x83D6}, {0x8440, 0x8460},
+    {0x8470, 0x847E}, {0x8480, 0x8491}, {0x849F, 0x84BE},
+};
+
+static int SjisColumn(unsigned short sjis) {
+    int trail = sjis & 0xFF;
+    return (sjis >> 8) * 188 + trail - 0x40 - (trail >= 0x7F);
+}
+
+u_long Krom2RawAdd(unsigned short sjis) {
+    int i, index = 0;
+    if (sjis >= 0x889F && sjis <= 0x9872) {
+        index = 524 + SjisColumn(sjis) - SjisColumn(0x889F);
+        return (u_long)&krom_font[index * 30];
+    }
+    if (sjis < 0x8140 || sjis > 0x84BE) {
+        return (u_long)-1;
+    }
+    for (i = 0; i < LEN(krom_non_kanji); i++) {
+        if (sjis < krom_non_kanji[i].first) {
+            break;
+        }
+        if (sjis <= krom_non_kanji[i].last) {
+            index += sjis - krom_non_kanji[i].first;
+            return (u_long)&krom_font[index * 30];
+        }
+        index += krom_non_kanji[i].last - krom_non_kanji[i].first + 1;
+    }
+    // HW returns 0xBFC66000 + sjis * 30, past the end of the ROM font
+    return (u_long)&krom_font[0];
+}
 
 int psyz_get_errno(void) {
     NOT_IMPLEMENTED;
