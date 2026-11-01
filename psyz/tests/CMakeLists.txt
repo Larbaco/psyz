@@ -16,7 +16,10 @@ set(PSYZ_TEST_SOURCES
     test_libspu.c
     test_libspu_bus.c
     test_libsnd_loop.c
+    test_libpress.c
     test_mdec.c
+    test_video.c
+    test_vlc_compat.c
     frontbuffer_psyz.c
 )
 

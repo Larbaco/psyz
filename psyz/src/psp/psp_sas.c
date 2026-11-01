@@ -604,6 +604,9 @@ static void sas_voice_ended(int v) {
     if (vs->env_state == ADSR_SUSTAIN && (vs->adsr_hi & 0x4000))
         return;
     vs->active = 0;
+    vs->env_vol = 0;
+    vs->env_state = ADSR_OFF;
+    _spu_RXX->rxx.voice[v].volumex = 0;
 }
 
 static void sas_dispatch(void) {

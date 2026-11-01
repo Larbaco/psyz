@@ -1,4 +1,5 @@
 #include "mdec.h"
+#include <psyz/mdec.h>
 #include <string.h>
 #include "../internal.h"
 
@@ -33,6 +34,8 @@ static const uint8_t scan[64] = {
 
 static uint32_t command;
 static int decode_error;
+static uint32_t io_command, io_control;
+static int io_pending;
 static uint8_t macroblock[768];
 static size_t pixel_pos, pixel_size;
 
@@ -188,6 +191,8 @@ void Psyz_MdecReset(void) {
     input_pos = input_size = pixel_pos = pixel_size = 0;
     command = 0;
     decode_error = 0;
+    io_command = io_control = 0;
+    io_pending = 0;
 }
 
 int Psyz_MdecCommand(uint32_t value, const void* data, size_t words) {
@@ -249,4 +254,57 @@ int Psyz_MdecRead(void* data, size_t words) {
         left -= count;
     }
     return 0;
+}
+
+void Psyz_MdecWrite(unsigned offset, u32 value) {
+    if (offset == 0) {
+        io_command = value;
+        io_pending = 1;
+    } else if (offset == 4) {
+        if (value & 0x80000000)
+            Psyz_MdecReset();
+        io_control = value & 0x60000000;
+    }
+}
+
+static int MdecHasInput(void) {
+    for (size_t i = input_pos; i + 1 < input_size; i += 2) {
+        if (HALFWORD(input + i) != 0xFE00)
+            return 1;
+    }
+    return 0;
+}
+
+u32 Psyz_MdecReadStatus(void) {
+    int busy = io_pending || MdecHasInput();
+    int output_ready =
+        pixel_pos < pixel_size || (!decode_error && !io_pending && busy);
+    uint32_t status = (command >> 2) & 0x07800000;
+    if (!output_ready)
+        status |= 1u << 31;
+    if (busy)
+        status |= 1u << 29;
+    if (io_pending && (io_control & (1u << 30)))
+        status |= 1u << 28;
+    if (output_ready && (io_control & (1u << 29)))
+        status |= 1u << 27;
+    status |= 4u << 16;
+    status |= busy ? ((input_size - input_pos) / 4 - 1) & 0xFFFF : 0xFFFF;
+    return status;
+}
+
+int Psyz_MdecDmaIn(const void* data, size_t words) {
+    if (!io_pending || !(io_control & (1u << 30)))
+        return -1;
+    int result = Psyz_MdecCommand(io_command, data, words);
+    if (!result)
+        io_pending = 0;
+    return result;
+}
+
+int Psyz_MdecDmaOut(void* data, size_t words) {
+    if (!(io_control & (1u << 29)) || io_pending ||
+        (pixel_pos == pixel_size && !MdecHasInput()))
+        return -1;
+    return Psyz_MdecRead(data, words);
 }

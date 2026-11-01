@@ -24,6 +24,7 @@ if(NOT PSP AND NOT PSYZ_NINTENDO_SWITCH)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
+    set(DARWIN ${APPLE})
     add_subdirectory(
         ${CMAKE_CURRENT_SOURCE_DIR}/../external/SDL
         ${CMAKE_CURRENT_BINARY_DIR}/sdl
@@ -197,9 +198,9 @@ set(PSYZ_SOURCES
     src/psyz/libsnd.c
     src/psyz/midiread_host.c
     src/psyz/libsn.c
-    src/psyz/libpress.c
     ../decomp/src/libpress/libpress.c
     src/psyz/mdec.c
+    src/psyz/vlc.c
 )
 
 # Choose sqrt implementation

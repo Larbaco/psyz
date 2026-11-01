@@ -6,6 +6,9 @@
 
 #include <psyz/log.h>
 
+// getScratchAddr()'s memory, aligned for any type a game keeps there.
+_Alignas(64) unsigned char Psyz_Scratchpad[256 * sizeof(u_long)];
+
 void MyPadInit(int mode);
 void PadInit(int mode) { MyPadInit(mode); }
 

@@ -16,8 +16,7 @@ layout(location = 11) flat in uvec4 texWindow;
 layout(set = 2, binding = 0) uniform sampler2D texVram;
 
 uvec2 resolveTexel() {
-    vec2 texelStep = vec2(abs(dFdx(rawUV.x)), abs(dFdy(rawUV.y)));
-    vec2 uv = rawUV - 0.5 * texelStep + 1.0 / 512.0;
+    vec2 uv = rawUV + 1.0 / 512.0;
     uvec2 texel = uvec2(clamp(floor(uv), vec2(0.0), vec2(255.0)));
     return (texel & texWindow.xy) | texWindow.zw;
 }
@@ -74,8 +73,9 @@ void main() {
     // PS1-accurate texture-color modulation: (tex5 * col8) >> 7, clamp to 31
     vec3 modColor;
     if (textureMode == 0u) {
-        // untextured: PS1 uses color directly, no modulation
-        modColor = texColor.rgb * vertexColor.rgb;
+        // untextured: PS1 uses color directly, truncated to 15-bit
+        vec3 col8 = floor(vertexColor.rgb * 255.0 + 0.5);
+        modColor = dither != 0u ? col8 / 255.0 : floor(col8 / 8.0) / 31.0;
     } else {
         vec3 tex5 = floor(texColor.rgb * 31.0 + 0.5);
         vec3 col8 = min(floor(vertexColor.rgb * 127.5 + 0.5), vec3(255.0));
