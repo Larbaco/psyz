@@ -68,8 +68,13 @@ static SDL_GPUTexture* rgb24_texture;
 static bool rgb24_dirty = true;
 static SDL_GPUSampler* vram_sampler = NULL;
 static SDL_GPUTexture* scaled_vram_render = NULL;
+static unsigned scaled_vram_res = 0;  // multiplier scaled_vram_render was made for
 static unsigned internal_res = 1;
 static unsigned set_internal_res = 1;
+// Psyz_VideoReserveInternalResolution: the multiplier whose targets stay alive
+// while internal_res is lower (0 = none), so switching down and up allocates
+// nothing
+static unsigned reserve_res = 0;
 static SDL_GPUBuffer* vbuf = NULL;
 static SDL_GPUBuffer* ibuf = NULL;
 static SDL_GPUBuffer* clear_vbuf = NULL;
@@ -104,8 +109,11 @@ static SDL_Rect scissor_rect = {0, 0, VRAM_W, VRAM_H};
 // x = gutter_px. Its columns [0, gutter_px) and past gutter_px + display width
 // are the gutters; the middle is refreshed from VRAM before each present.
 static unsigned gutter_px = 0;
-static SDL_GPUTexture* gutter_render = NULL;
-static unsigned gutter_render_res = 0;
+// Slot 0 serves the native multiplier, slot 1 a scaled one (kept alive while
+// Psyz_VideoReserveInternalResolution asks for it).
+static SDL_GPUTexture* gutter_render[2] = {NULL, NULL};
+static unsigned gutter_render_res[2] = {0, 0};
+static int gutter_last_slot = -1;  // the slot GetGutterTarget handed out last
 
 static PsyzOverlayInitCB_SDL3GPU overlay_init_cb;
 PsyzOverlayInitCB_SDL3GPU Psyz_OverlayInit_SDL3GPU(
@@ -559,14 +567,40 @@ static bool GutterActive(void) {
            draw_area_end.y >= draw_area_start.y;
 }
 
+static void ReleaseGutterSlot(int slot) {
+    if (gutter_render[slot]) {
+        SDL_ReleaseGPUTexture(device, gutter_render[slot]);
+        gutter_render[slot] = NULL;
+        gutter_render_res[slot] = 0;
+        if (gutter_last_slot == slot) {
+            gutter_last_slot = -1;
+        }
+    }
+}
+
+// The target the gutters draw into at the multiplier in force, or NULL when none
+// has been made yet (it is made on first use, by GetGutterTarget).
+static SDL_GPUTexture* ActiveGutterTarget(void) {
+    const int slot = internal_res <= 1 ? 0 : 1;
+    return gutter_render[slot] && gutter_render_res[slot] == internal_res
+               ? gutter_render[slot]
+               : NULL;
+}
+
+static void ClearTargetRect(SDL_GPUTexture* texture, int x, int y, int w,
+                            int h, u_char r, u_char g, u_char b);
+
 static SDL_GPUTexture* GetGutterTarget(void) {
-    if (gutter_render && gutter_render_res == internal_res) {
-        return gutter_render;
+    const int slot = internal_res <= 1 ? 0 : 1;
+    if (gutter_render[slot] && gutter_render_res[slot] == internal_res) {
+        if (slot != gutter_last_slot) {
+            // it was idle while the other multiplier drew: its gutters are old
+            gutter_last_slot = slot;
+            ClearTargetRect(gutter_render[slot], 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
+        }
+        return gutter_render[slot];
     }
-    if (gutter_render) {
-        SDL_ReleaseGPUTexture(device, gutter_render);
-        gutter_render = NULL;
-    }
+    ReleaseGutterSlot(slot);
     const SDL_GPUTextureCreateInfo info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
         .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
@@ -577,24 +611,25 @@ static SDL_GPUTexture* GetGutterTarget(void) {
         .layer_count_or_depth = 1,
         .num_levels = 1,
     };
-    gutter_render = SDL_CreateGPUTexture(device, &info);
-    if (!gutter_render) {
+    gutter_render[slot] = SDL_CreateGPUTexture(device, &info);
+    if (!gutter_render[slot]) {
         ERRORF("gutter texture creation failed: %s", SDL_GetError());
         return NULL;
     }
-    gutter_render_res = internal_res;
+    gutter_render_res[slot] = internal_res;
+    gutter_last_slot = slot;
     // start black: a fresh texture has undefined contents
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (cmd) {
         const SDL_GPUColorTargetInfo target = {
-            .texture = gutter_render,
+            .texture = gutter_render[slot],
             .clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
             .load_op = SDL_GPU_LOADOP_CLEAR,
             .store_op = SDL_GPU_STOREOP_STORE,
         };
         SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &target, 1, NULL));
     }
-    return gutter_render;
+    return gutter_render[slot];
 }
 
 static SDL_GPUTexture* GetRenderTarget(void) {
@@ -695,6 +730,7 @@ static bool CreateScaledVramTarget(unsigned n) {
     if (scaled_vram_render) {
         SDL_ReleaseGPUTexture(device, scaled_vram_render);
         scaled_vram_render = NULL;
+        scaled_vram_res = 0;
     }
     const SDL_GPUTextureCreateInfo info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
@@ -712,6 +748,7 @@ static bool CreateScaledVramTarget(unsigned n) {
             "scaled VRAM texture creation failed (%dx): %s", n, SDL_GetError());
         return false;
     }
+    scaled_vram_res = n;
     return true;
 }
 
@@ -991,10 +1028,14 @@ static unsigned AdjustInternalRes(unsigned scale) {
     return n;
 }
 
+static void ApplyReserveInternalRes(void);
+
 static void ApplyPendingInternalRes(void) {
     if (!sdl3_window || !is_platform_init_successful) {
         return;
     }
+    // a reserve asked for before the window existed is made on the first call
+    ApplyReserveInternalRes();
     if (internal_res_auto) {
         VideoLayout layout = ResolveVideoLayout();
         set_internal_res = GetAutoInternalRes(&layout);
@@ -1007,13 +1048,16 @@ static void ApplyPendingInternalRes(void) {
         return;
     }
     Draw_FlushBuffer(); // render pending prims with the old multiplier
-    if (n > 1 && !CreateScaledVramTarget(n)) {
+    // a target kept alive for this multiplier (Psyz_VideoReserveInternalResolution)
+    // is reused: no allocation, only the upscale below
+    if (n > 1 && (!scaled_vram_render || scaled_vram_res != n) &&
+        !CreateScaledVramTarget(n)) {
         n = 1;
         set_internal_res = 1;
         internal_res_auto = false;
     }
     if (n > 1) {
-        // upscale the whole native VRAM into the freshly created scaled target
+        // upscale the whole native VRAM into the (re)used scaled target
         SDL_GPUCommandBuffer* cmd = AcquireCmd();
         if (cmd) {
             const SDL_GPUBlitInfo blit = {
@@ -1026,9 +1070,11 @@ static void ApplyPendingInternalRes(void) {
             };
             SDL_BlitGPUTexture(cmd, &blit);
         }
-    } else if (scaled_vram_render) {
+    } else if (scaled_vram_render &&
+               !(reserve_res > 1 && scaled_vram_res == reserve_res)) {
         SDL_ReleaseGPUTexture(device, scaled_vram_render);
         scaled_vram_render = NULL;
+        scaled_vram_res = 0;
     }
     internal_res = n;
     UpdateScissor();
@@ -1261,12 +1307,10 @@ static void QuitPlatform(void) {
         if (scaled_vram_render) {
             SDL_ReleaseGPUTexture(device, scaled_vram_render);
             scaled_vram_render = NULL;
+            scaled_vram_res = 0;
         }
-        if (gutter_render) {
-            SDL_ReleaseGPUTexture(device, gutter_render);
-            gutter_render = NULL;
-            gutter_render_res = 0;
-        }
+        ReleaseGutterSlot(0);
+        ReleaseGutterSlot(1);
         ReleaseCanvases();
         if (vram_sampler) {
             SDL_ReleaseGPUSampler(device, vram_sampler);
@@ -1465,6 +1509,40 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
     return 0;
 }
 
+// Brings the kept-alive targets in line with reserve_res while internal_res is
+// native: allocates the scaled VRAM target for the reserved multiplier, or
+// drops what no longer matches. With internal_res > 1 the targets are in use
+// and ApplyPendingInternalRes owns them.
+static void ApplyReserveInternalRes(void) {
+    if (!sdl3_window || !is_platform_init_successful || internal_res > 1) {
+        return;
+    }
+    const unsigned want = reserve_res > 1 ? AdjustInternalRes(reserve_res) : 0;
+    if (scaled_vram_render && scaled_vram_res != want) {
+        SDL_ReleaseGPUTexture(device, scaled_vram_render);
+        scaled_vram_render = NULL;
+        scaled_vram_res = 0;
+    }
+    if (want > 1 && !scaled_vram_render && CreateScaledVramTarget(want)) {
+        INFOF("internal resolution %dx reserved (%dx%d)", want, VRAM_W * want,
+              VRAM_H * want);
+    }
+    if (gutter_render[1] && gutter_render_res[1] != want) {
+        ReleaseGutterSlot(1);
+    }
+}
+
+int Psyz_VideoReserveInternalResolution(unsigned multiplier) {
+    if (multiplier > PSYZ_INTERNAL_RES_MAX) {
+        WARNF("internal resolution %dx exceeds maximum value of %dx",
+              multiplier, PSYZ_INTERNAL_RES_MAX);
+        return -1;
+    }
+    reserve_res = multiplier > 1 ? multiplier : 0;
+    ApplyReserveInternalRes();
+    return 0;
+}
+
 unsigned Psyz_VideoGetGutter(void) { return gutter_px; }
 
 static void ClearTargetRect(SDL_GPUTexture* texture, int x, int y, int w,
@@ -1476,8 +1554,8 @@ int Psyz_VideoSetGutter(unsigned px) {
     }
     if (px != gutter_px) {
         Draw_FlushBuffer(); // pending prims belong to the old gutter
-        if (gutter_render) {
-            ClearTargetRect(gutter_render, 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
+        if (ActiveGutterTarget()) {
+            ClearTargetRect(ActiveGutterTarget(), 0, 0, VRAM_W, VRAM_H, 0, 0, 0);
         }
         gutter_px = px;
     }
@@ -1586,12 +1664,12 @@ void Draw_DisplayArea(unsigned int x, unsigned int y) {
         SyncCanvasToVram(fb_index);
         DiscardCanvas(fb_index);
     }
-    if (moved && gutter_px > 0 && gutter_render) {
+    if (moved && gutter_px > 0 && ActiveGutterTarget()) {
         // a flip: the buffer drawn next starts with black gutters
-        ClearTargetRect(gutter_render, 0, 0, VRAM_W, display_area.y, 0, 0, 0);
+        SDL_GPUTexture* gutters = ActiveGutterTarget();
+        ClearTargetRect(gutters, 0, 0, VRAM_W, display_area.y, 0, 0, 0);
         int below = display_area.y + display_size.y;
-        ClearTargetRect(
-            gutter_render, 0, below, VRAM_W, VRAM_H - below, 0, 0, 0);
+        ClearTargetRect(gutters, 0, below, VRAM_W, VRAM_H - below, 0, 0, 0);
     }
     ApplyDisplayPendingChanges();
 }

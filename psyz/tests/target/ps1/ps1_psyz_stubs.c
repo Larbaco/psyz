@@ -210,6 +210,12 @@ int Psyz_VideoSetInternalResolution(unsigned multiplier) {
 
 unsigned Psyz_VideoGetInternalResolution(void) { return 1; }
 
+int Psyz_VideoReserveInternalResolution(unsigned multiplier) {
+    (void)multiplier;
+    return 0;
+}
+
+
 int Psyz_VideoSetResolution(PsyzSize size) {
     return size.w == 0 && size.h == 0 ? 0 : -1;
 }
